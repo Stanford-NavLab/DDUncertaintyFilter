@@ -1,0 +1,12 @@
+
+meas.npy: concatenated carrier and code phase measurements in the following format:
+[lda*carriers, codes] where:
+f = 1575.42 * 10 ** 6
+c = 299792458, and lda = c / f
+
+sat_pos.npy: GPS satellite positions in ECEF X,Y and Z
+
+geom.npy: DD geometry matrix containng LOS vectors in ENU
+
+time.npy: time in GPS week in seconds
+

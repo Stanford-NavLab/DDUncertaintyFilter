@@ -1,0 +1,13 @@
+import os
+from textwrap import wrap
+import numpy as np
+import math
+
+#from scipy.sparse.linalg.dsolve.linsolve import use_solver
+from preprocessing import *
+import matplotlib.pyplot as plt
+import pandas as pd
+from utils import *
+
+bei_sat = np.load('sat_pos_bei.npy', allow_pickle= True)
+print (bei_sat)

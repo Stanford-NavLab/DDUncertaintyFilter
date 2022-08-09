@@ -72,53 +72,63 @@ class CarPoseDynamicsModel(tfilter.base.DynamicsModel):
 
 class CarFullPoseDynamicsModel(tfilter.base.DynamicsModel):
     def __init__(self, N_dim=31+32):
-        super().__init__(state_dim=(3+4)*2 + N_dim)
+        super().__init__(state_dim=10 + N_dim)
         dt = 0.0025
         self.N_dim = N_dim
-        self.update_dt(dt)
-    
-    def update_dt(self, dt):
-        fac_a = 0.1 # Retention factor
-        fac_b = 0.7 # Weighting factor
+        self.xy_std = torch.nn.Parameter(torch.tensor(2000.0))
+        self.z_std = torch.nn.Parameter(torch.tensor(0.005))
+        self.q_std = torch.tensor([0.01, 0.01, 0.01, 0.01])
+        self.v_std = torch.tensor([1.0, 1.0, 1e-3])
         
-        self.A = torch.eye(self.state_dim - self.N_dim)
-        self.A[3:7, 3:7] = torch.eye(4)*fac_b
-        self.A[10:14, 10:14] = torch.eye(4)*fac_a
-        self.A[:3, 7:10] = torch.eye(3)*dt
-        self.A[3:7, 10:14] = torch.eye(4)*dt*fac_b
+        self.Qxy = torch.eye(2)*dt*self.xy_std
+        self.Qz = dt*self.z_std
+        self.Qq = torch.diag(self.q_std)*dt
+        self.Qv = torch.diag(self.v_std)*dt
         
-        self.B = torch.zeros(self.state_dim - self.N_dim, 11)
-        self.B[3:7, 7:11] = torch.eye(4)*(1-fac_b)
-        self.B[7:10, :3] = torch.eye(3)*dt
-        self.B[10:14, 3:7] = torch.eye(4)*(1-fac_a)
-        
-        prop_std = torch.ones(self.state_dim)
-        prop_std[:3] *= np.sqrt(dt*10)   # x, y, z
-        prop_std[3:7] *= np.sqrt(dt*0.1)  # q
-        prop_std[7:10] *= np.sqrt(dt*1)    # v
-        prop_std[10:14] *= np.sqrt(dt*0.1)  # q_dot
         if self.N_dim > 0:
-            prop_std[14:] *= 1  # N
-        self.Q = torch.diag(prop_std)
+            self.QN = torch.eye(self.N_dim)*dt  # N
+        
+        self.update_dt_cov(dt, self.Qq[:3, :3]/dt, self.Qv/dt)
     
+    def update_dt_cov(self, dt, q_cov, v_cov):
+        self.dt = dt
+        self.Qq[:3, :3] = q_cov
+        self.Qv = v_cov
+        
     def forward(self, initial_states, controls):
         N, state_dim = initial_states.shape
         assert self.state_dim == state_dim
         
-        or_quat = initial_states[:, 3:7].detach()
-        term_3 = controls[:, 6:]
-#         or_quat = term_3
+        x = initial_states[:, :3]
+        quat = initial_states[:, 3:7]
+        x_dot = initial_states[:, 7:10]
+        
+        accel = controls[:, :3]
+        omega = controls[:, 3:6]
         
         gravity = torch.zeros((N, 3))
         gravity[:, -1] = 9.81
-        term_1 = tf.quaternion_apply(or_quat, controls[:, :3]) - gravity
-        term_2 = quat_dot(or_quat, controls[:, 3:6])
         
-        controls = torch.cat((term_1, term_2, term_3), -1)
+        accel_enu = tf.quaternion_apply(quat, accel) - gravity
+        accel_enu[:, :] = 0.0
         
-        x_q_xdot_qdot = initial_states[:, :14]
-        N_allsv = initial_states[:, 14:]
+        quat_dot = compute_quat_dot(quat, omega)
         
-        predicted_states = batched_mm(self.A, x_q_xdot_qdot) + batched_mm(self.B, controls) 
+        predicted_x = x + self.dt*x_dot
+        predicted_quat = quat + self.dt*quat_dot
+        predicted_x_dot = x_dot + self.dt*accel_enu
         
-        return torch.cat((predicted_states, N_allsv), -1), self.Q.expand((N, state_dim, state_dim))
+        predicted_states = torch.cat((predicted_x, predicted_quat, predicted_x_dot), -1)
+        
+        Q = torch.eye(state_dim)
+        Q[:2, :2] = self.Qxy
+        Q[2, 2] = self.Qz
+        Q[3:7, 3:7] = self.Qq
+        Q[7:10, 7:10] = self.Qv
+        
+        if self.N_dim > 0:
+            N_allsv = initial_states[:, 14:]
+            predicted_states = torch.cat((predicted_states, N_allsv), -1)
+            Q[10:, 10:] = self.QN
+        
+        return predicted_states, Q.expand((N, state_dim, state_dim))

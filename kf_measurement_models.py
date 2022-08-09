@@ -45,10 +45,9 @@ class GNSSKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         return expected_observation, R
     
 class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
-    def __init__(self, base_pos, N_dim=31+32):
-        super().__init__(state_dim=14 + N_dim, observation_dim=10)
-        self.pr_std = 5
-        self.carr_std = 5
+    def __init__(self, base_pos, N_dim=0):
+        super().__init__(state_dim=10 + N_dim, observation_dim=10)
+        self.measurement_std = torch.nn.Parameter(torch.tensor([5.0, 5.0]))
         self.satXYZb = None
         self.idx_code_mask = None
         self.idx_carr_mask = None                     
@@ -70,15 +69,65 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def forward(self, states):
         N, state_dim = states.shape
         pos = states[:, :3]
-        N_allsvs = states[:, 14:]
+        if state_dim>14:
+            N_allsvs = states[:, 14:]
+        else:
+            N_allsvs = None
 
         expected_observation_code, expected_observation_carr = expected_d_diff(self.satXYZb, states, self.base_pos[None, :], idx_code_mask=self.idx_code_mask, idx_carr_mask=self.idx_carr_mask, ref_idx=self.ref_idx, inter_const_bias=self.inter_const_bias, N_allsvs=N_allsvs)
 
         expected_observation = torch.cat((expected_observation_code, expected_observation_carr), -1)
         
         R = torch.eye(self.observation_dim)
-        R[:self.code_dim, :self.code_dim] *= self.pr_std
-        R[self.code_dim:, self.code_dim:] *= self.carr_std
+        R[:self.code_dim, :self.code_dim] *= self.measurement_std[0]
+        R[self.code_dim:, self.code_dim:] *= self.measurement_std[1]
         R = R.expand((N, self.observation_dim, self.observation_dim))
         
         return expected_observation.float(), R.float()
+    
+class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
+    def __init__(self, N_dim=0):
+        super().__init__(state_dim=10 + N_dim, observation_dim=4)
+        self.AHRS_cov = torch.eye(4)
+         
+    def update_std(self, AHRS_cov):
+        self.AHRS_cov = torch.eye(4)
+        self.AHRS_cov[1:, 1:] = AHRS_cov
+        self.AHRS_cov *= 0.025
+        
+    def forward(self, states):
+        N, state_dim = states.shape
+        quat = states[:, 3:7]
+        
+        orientation = tf.quaternion_invert(quat)
+        
+        R = self.AHRS_cov.expand((N, self.observation_dim, self.observation_dim))
+        
+        return orientation.float(), R.float()
+    
+class IMUDDMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
+    def __init__(self, base_pos, N_dim=0):
+        super().__init__(state_dim=10 + N_dim, observation_dim=14)
+        self.imu_model = IMUMeasurementModel()
+        self.gnss_model = GNSSDDKFMeasurementModel(base_pos)
+        self.mode = "imu"
+         
+    def update_imu_std(self, AHRS_cov):
+        self.imu_model.update_std(AHRS_cov)
+        self.observation_dim = 4
+        self.mode = "imu"
+        
+    def update_sats(self, satXYZb, idx_code_mask, idx_carr_mask, ref_idx, inter_const_bias=None):
+        self.gnss_model.update_sats(satXYZb, idx_code_mask, idx_carr_mask, ref_idx, inter_const_bias=inter_const_bias)
+        self.observation_dim = self.gnss_model.observation_dim
+        self.mode = "gnss"
+        
+    def forward(self, states):
+        N, state_dim = states.shape
+        
+        if self.mode=="imu":
+            meas, R = self.imu_model(states)
+        elif self.mode=="gnss":
+            meas, R = self.gnss_model(states)
+        
+        return meas, R

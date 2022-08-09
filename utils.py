@@ -13,6 +13,8 @@ from itertools import chain, compress
 import pytorch3d.transforms as tf
 from queue import Queue
 from coordinates import *
+import pymap3d as pm
+import xarray as xr
 
 # quaternion representation: [x, y, z, w]
 # JPL convention
@@ -48,14 +50,20 @@ def gt_to_ecef(data_gt):
 def gt_to_ned(data_gt, lcoord):
     return torch.tensor([*lcoord.geodetic2ned(read_lla(data_gt))], dtype=torch.float32)
 
+def get_reference_from_gt(line):
+    vals = line.split("  ")
+    reference_lla = [dms2dec(vals[0]), dms2dec(vals[1]), float(vals[-1])]
+    reference_ecef = geodetic2ecef(reference_lla)
+    return reference_lla, reference_ecef
+
 def parse_imu_data(row):
-    timestamp = (row.loc['%time'].to_numpy()/1e9)
-    or_quat = row.loc[['field.orientation.w', 'field.orientation.x', 'field.orientation.y', 'field.orientation.z']].to_numpy().astype(np.float32)
-    or_cov = row.loc[['field.orientation_covariance0', 'field.orientation_covariance1', 'field.orientation_covariance2', 
+    timestamp = (row.sel(dim_1="%time").to_numpy()/1e9)
+    or_quat = row.sel(dim_1=['field.orientation.w', 'field.orientation.x', 'field.orientation.y', 'field.orientation.z']).to_numpy().astype(np.float32)
+    or_cov = row.sel(dim_1=['field.orientation_covariance0', 'field.orientation_covariance1', 'field.orientation_covariance2', 
                       'field.orientation_covariance3','field.orientation_covariance4', 'field.orientation_covariance5',
-                      'field.orientation_covariance6', 'field.orientation_covariance7', 'field.orientation_covariance8']].to_numpy().reshape((3, 3)).astype(np.float32)
-    ang_vel = row.loc[['field.angular_velocity.x', 'field.angular_velocity.y', 'field.angular_velocity.z']].to_numpy().astype(np.float32)
-    ang_vel_cov = row.loc[['field.angular_velocity_covariance0',
+                      'field.orientation_covariance6', 'field.orientation_covariance7', 'field.orientation_covariance8']).to_numpy().reshape((-1, 3, 3)).astype(np.float32)
+    ang_vel = row.sel(dim_1=['field.angular_velocity.x', 'field.angular_velocity.y', 'field.angular_velocity.z']).to_numpy().astype(np.float32)
+    ang_vel_cov = row.sel(dim_1=['field.angular_velocity_covariance0',
        'field.angular_velocity_covariance1',
        'field.angular_velocity_covariance2',
        'field.angular_velocity_covariance3',
@@ -63,10 +71,10 @@ def parse_imu_data(row):
        'field.angular_velocity_covariance5',
        'field.angular_velocity_covariance6',
        'field.angular_velocity_covariance7',
-       'field.angular_velocity_covariance8']].to_numpy().reshape((3, 3)).astype(np.float32)
-    lin_acc = row.loc[['field.linear_acceleration.x',
-       'field.linear_acceleration.y', 'field.linear_acceleration.z']].to_numpy().astype(np.float32)
-    lin_acc_cov = row.loc[['field.linear_acceleration_covariance0',
+       'field.angular_velocity_covariance8']).to_numpy().reshape((-1, 3, 3)).astype(np.float32)
+    lin_acc = row.sel(dim_1=['field.linear_acceleration.x',
+       'field.linear_acceleration.y', 'field.linear_acceleration.z']).to_numpy().astype(np.float32)
+    lin_acc_cov = row.sel(dim_1=['field.linear_acceleration_covariance0',
        'field.linear_acceleration_covariance1',
        'field.linear_acceleration_covariance2',
        'field.linear_acceleration_covariance3',
@@ -74,7 +82,7 @@ def parse_imu_data(row):
        'field.linear_acceleration_covariance5',
        'field.linear_acceleration_covariance6',
        'field.linear_acceleration_covariance7',
-       'field.linear_acceleration_covariance8']].to_numpy().reshape((3, 3)).astype(np.float32)
+       'field.linear_acceleration_covariance8']).to_numpy().reshape((-1, 3, 3)).astype(np.float32)
     return timestamp, torch.tensor(or_quat), torch.tensor(or_cov), torch.tensor(ang_vel), torch.tensor(ang_vel_cov), torch.tensor(lin_acc), torch.tensor(lin_acc_cov)
 
 def gps2utc(time):
@@ -101,6 +109,72 @@ def read_gnss_data(dd_data, dd_tidx, constellation):
         idx_carr_mask = np.logical_not(np.isnan(rover_carr))
     return rover_code, base_code, rover_carr, base_carr, satpos, idx_code_mask, idx_carr_mask
 
+def load_ground_truth(fpath, origin_lla):
+    fluff = 2
+    header = ["UTCTime", "Week", "GPSTime", "Latitude", "Longitude", "H-Ell", "ECEFX", "ECEFY", "ECEFZ", "ENUX", "ENUY", "ENUZ", "VelBdyX", "VelBdyY", "VelBdyZ", "AccBdyX", "AccBdyY", "AccBdyZ", "Roll", "Pitch", "Heading", "Q"]
+    all_data = []
+    with open(fpath, "r") as f:
+        for line in f:
+            if fluff>0:
+                fluff -= 1
+                continue
+            d = line.split()
+            new_data = [float(d[0]), float(d[1]), float(d[2])]
+            lla = [dms2dec(d[3:6]), dms2dec(d[6:9]), float(d[9])]
+            ecef = list(geodetic2ecef(lla))
+            enu = list(pm.geodetic2enu(*lla, *origin_lla))
+            new_data += lla
+            new_data += ecef
+            new_data += enu
+            new_data += [float(t) for t in d[10:]]
+            all_data.append(new_data)
+    all_data = np.array(all_data)
+    return xr.DataArray(pd.DataFrame(all_data, columns=header))
+
+def load_dd_data(origin_lla, x0):
+    base_path = "/home/users/shubhgup/Codes/KITTI360_Processing/TRI_KF/save_data/"
+    time_gt = gps2utc(np.load(os.path.join(base_path, "time_gt.npy")))
+    
+    base_station_ecef = np.array([-2414266.9197,5386768.9868, 2407460.0314])
+    
+    lat0 = origin_lla[0]
+    lon0 = origin_lla[1]
+    alt0 = origin_lla[2]
+    
+    base_station_enu = ecef2enu(base_station_ecef, lat0, lon0, x0)
+    
+    beidou_base_measurements_carr = np.load(os.path.join(base_path, "beidou_base_measurements_carr.npy"))
+    beidou_base_measurements_code = np.load(os.path.join(base_path, "beidou_base_measurements_code.npy"))
+    beidou_rover_measurements_carr = np.load(os.path.join(base_path, "beidou_rover_measurements_carr.npy"))
+    beidou_rover_measurements_code = np.load(os.path.join(base_path, "beidou_rover_measurements_code.npy"))
+    beidou_ecef_svs = np.load(os.path.join(base_path, "beidou_ecef_svs.npy"))
+    beidou_enu_svs = ecef2enu(beidou_ecef_svs, lat0, lon0, x0)
+    
+    gps_base_measurements_carr = np.load(os.path.join(base_path, "gps_base_measurements_carr.npy"))
+    gps_base_measurements_code = np.load(os.path.join(base_path, "gps_base_measurements_code.npy"))
+    gps_rover_measurements_carr = np.load(os.path.join(base_path, "gps_rover_measurements_carr.npy"))
+    gps_rover_measurements_code = np.load(os.path.join(base_path, "gps_rover_measurements_code.npy"))
+    gps_ecef_svs = np.load(os.path.join(base_path, "gps_ecef_svs.npy"))
+    gps_enu_svs = ecef2enu(gps_ecef_svs, lat0, lon0, x0)
+    
+    inter_const_bias = np.zeros(31 + 32)
+    inter_const_bias[31:] = 17.5916
+    
+    return xr.Dataset(dict(
+        time_gt=("t", time_gt), 
+        beidou_base_measurements_carr=(["t", "sv_bei"], beidou_base_measurements_carr),
+       beidou_base_measurements_code=(["t", "sv_bei"], beidou_base_measurements_code),
+       beidou_rover_measurements_carr=(["t", "sv_bei"], beidou_rover_measurements_carr),
+       beidou_rover_measurements_code=(["t", "sv_bei"], beidou_rover_measurements_code),
+       beidou_enu_svs=(["t", "sv_bei", "pos"], beidou_enu_svs),
+       gps_base_measurements_carr=(["t", "sv_gps"], gps_base_measurements_carr),
+       gps_base_measurements_code=(["t", "sv_gps"], gps_base_measurements_code),
+       gps_rover_measurements_carr=(["t", "sv_gps"], gps_rover_measurements_carr),
+       gps_rover_measurements_code=(["t", "sv_gps"], gps_rover_measurements_code),
+       gps_enu_svs=(["t", "sv_gps", "pos"], gps_enu_svs),
+       base_station_enu=("pos", base_station_enu),
+       inter_const_bias=("sv_all", inter_const_bias) 
+      ))
 ####################################################################################################################
 # SE(3) ops
 ####################################################################################################################
@@ -113,7 +187,7 @@ def vars_to_H(trans_vars, rot_vars):
     elif len(rot_vars)==2:
         return _vars_to_H_6dof(trans_vars, *rot_vars)
         
-def quat_dot(q, omega):
+def compute_quat_dot(q, omega):
     real_parts = omega.new_zeros(omega.shape[:-1] + (1,))
     omega_as_quaternion = torch.cat((real_parts, omega), -1)
     return 0.5*tf.quaternion_raw_multiply(q, omega_as_quaternion)   
@@ -307,28 +381,26 @@ def _eul2rot_torch(theta):
 
     return R
 
-def euler_from_quaternion(q):
-        """
-        Convert a quaternion into euler angles (roll, pitch, yaw)
-        roll is rotation around x in radians (counterclockwise)
-        pitch is rotation around y in radians (counterclockwise)
-        yaw is rotation around z in radians (counterclockwise)
-        """
-        x, y, z, w = q
-        t0 = +2.0 * (w * x + y * z)
-        t1 = +1.0 - 2.0 * (x * x + y * y)
-        roll_x = math.atan2(t0, t1)
-     
-        t2 = +2.0 * (w * y - z * x)
-        t2 = +1.0 if t2 > +1.0 else t2
-        t2 = -1.0 if t2 < -1.0 else t2
-        pitch_y = math.asin(t2)
-     
-        t3 = +2.0 * (w * z + x * y)
-        t4 = +1.0 - 2.0 * (y * y + z * z)
-        yaw_z = math.atan2(t3, t4)
-     
-        return np.array([roll_x, pitch_y, yaw_z]) # in radians
+def quaternion_to_euler_angle_vectorized(w, x, y, z):
+    ysqr = y * y
+
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + ysqr)
+    X = np.degrees(np.arctan2(t0, t1))
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = np.where(t2>+1.0,+1.0,t2)
+    #t2 = +1.0 if t2 > +1.0 else t2
+
+    t2 = np.where(t2<-1.0, -1.0, t2)
+    #t2 = -1.0 if t2 < -1.0 else t2
+    Y = np.degrees(np.arcsin(t2))
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (ysqr + z * z)
+    Z = np.degrees(np.arctan2(t3, t4))
+
+    return X, Y, Z 
 
 def from_two_vectors(v0, v1):
     """
@@ -576,7 +648,6 @@ def show_image(img_bgr):
     plt.figure(figsize= (15,8), dpi= 80)
     plt.imshow(img_rgb)
 
-
 ####################################################################################################################
 # General ops
 ####################################################################################################################
@@ -585,6 +656,10 @@ def shift_bit_length(x):
     return 1<<((x-1).bit_length()-1)
 
 def dms2dec(x):
+    if type(x)==str:
+        x = [float(x_i) for x_i in x.split(" ")]
+    elif type(x[0])==str:
+        x = [float(x_i) for x_i in x]
     return x[0] + x[1]/60 + x[2]/(60*60)
 
 # Utility function for selecting arbitrary objects based on mask
@@ -597,3 +672,7 @@ def data_tensor(x_list):
 
 def to_tensor(x_list):
     return tuple([torch.tensor(x) for x in x_list])
+
+def set_requires_grad(module, val):
+    for p in module.parameters():
+        p.requires_grad = val
