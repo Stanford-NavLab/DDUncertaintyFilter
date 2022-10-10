@@ -56,6 +56,11 @@ def get_reference_from_gt(line):
     reference_ecef = geodetic2ecef(reference_lla)
     return reference_lla, reference_ecef
 
+def get_reference_rot(line):
+    vals = line.split()
+    reference_rpy = np.array([float(vals[0]), float(vals[1]), -float(vals[2])])
+    return reference_rpy
+
 def parse_imu_data(row):
     timestamp = (row.sel(dim_1="%time").to_numpy()/1e9)
     or_quat = row.sel(dim_1=['field.orientation.w', 'field.orientation.x', 'field.orientation.y', 'field.orientation.z']).to_numpy().astype(np.float32)
@@ -95,9 +100,10 @@ def read_gnss_data(dd_data, dd_tidx, constellation):
     if constellation=='mixed':
         dd_data_gps = read_gnss_data(dd_data, dd_tidx, 'gps')
         dd_data_beidou = read_gnss_data(dd_data, dd_tidx, 'beidou')
-        rover_code, base_code, rover_carr, base_carr, satpos, idx_code_mask, idx_carr_mask = tuple([np.concatenate([g, b], axis=0) for g, b in zip(dd_data_gps, dd_data_beidou)])
+        rover_code, base_code, rover_carr, base_carr, rover_cnos, satpos, idx_code_mask, idx_carr_mask = tuple([np.concatenate([g, b], axis=0) for g, b in zip(dd_data_gps, dd_data_beidou)])
     elif constellation=='gps' or constellation=='beidou':
         rover_code = dd_data[constellation+'_rover_measurements_code'][dd_tidx].to_numpy()
+        rover_cnos = dd_data[constellation+'_rover_measurements_cnos'][dd_tidx].to_numpy()
         base_code = dd_data[constellation+'_base_measurements_code'][dd_tidx].to_numpy()
 
         rover_carr = dd_data[constellation+'_rover_measurements_carr'][dd_tidx].to_numpy()
@@ -107,7 +113,7 @@ def read_gnss_data(dd_data, dd_tidx, constellation):
 
         idx_code_mask = np.logical_not(np.isnan(rover_code))
         idx_carr_mask = np.logical_not(np.isnan(rover_carr))
-    return rover_code, base_code, rover_carr, base_carr, satpos, idx_code_mask, idx_carr_mask
+    return rover_code, base_code, rover_carr, base_carr, rover_cnos, satpos, idx_code_mask, idx_carr_mask
 
 def load_ground_truth(fpath, origin_lla):
     fluff = 2
@@ -147,6 +153,7 @@ def load_dd_data(origin_lla, x0):
     beidou_base_measurements_code = np.load(os.path.join(base_path, "beidou_base_measurements_code.npy"))
     beidou_rover_measurements_carr = np.load(os.path.join(base_path, "beidou_rover_measurements_carr.npy"))
     beidou_rover_measurements_code = np.load(os.path.join(base_path, "beidou_rover_measurements_code.npy"))
+    beidou_rover_measurements_cnos = np.load(os.path.join(base_path, "beidou_rover_measurements_cnos_new.npy"))
     beidou_ecef_svs = np.load(os.path.join(base_path, "beidou_ecef_svs.npy"))
     beidou_enu_svs = ecef2enu(beidou_ecef_svs, lat0, lon0, x0)
     
@@ -154,6 +161,7 @@ def load_dd_data(origin_lla, x0):
     gps_base_measurements_code = np.load(os.path.join(base_path, "gps_base_measurements_code.npy"))
     gps_rover_measurements_carr = np.load(os.path.join(base_path, "gps_rover_measurements_carr.npy"))
     gps_rover_measurements_code = np.load(os.path.join(base_path, "gps_rover_measurements_code.npy"))
+    gps_rover_measurements_cnos = np.load(os.path.join(base_path, "gps_rover_measurements_cnos_new.npy"))
     gps_ecef_svs = np.load(os.path.join(base_path, "gps_ecef_svs.npy"))
     gps_enu_svs = ecef2enu(gps_ecef_svs, lat0, lon0, x0)
     
@@ -166,15 +174,77 @@ def load_dd_data(origin_lla, x0):
        beidou_base_measurements_code=(["t", "sv_bei"], beidou_base_measurements_code),
        beidou_rover_measurements_carr=(["t", "sv_bei"], beidou_rover_measurements_carr),
        beidou_rover_measurements_code=(["t", "sv_bei"], beidou_rover_measurements_code),
+       beidou_rover_measurements_cnos=(["t", "sv_bei"], beidou_rover_measurements_cnos),
        beidou_enu_svs=(["t", "sv_bei", "pos"], beidou_enu_svs),
        gps_base_measurements_carr=(["t", "sv_gps"], gps_base_measurements_carr),
        gps_base_measurements_code=(["t", "sv_gps"], gps_base_measurements_code),
        gps_rover_measurements_carr=(["t", "sv_gps"], gps_rover_measurements_carr),
        gps_rover_measurements_code=(["t", "sv_gps"], gps_rover_measurements_code),
+       gps_rover_measurements_cnos=(["t", "sv_gps"], gps_rover_measurements_cnos),
        gps_enu_svs=(["t", "sv_gps", "pos"], gps_enu_svs),
        base_station_enu=("pos", base_station_enu),
        inter_const_bias=("sv_all", inter_const_bias) 
       ))
+
+def get_N_hypotheses_true(utc_t, ints_data, isref=False):
+    true_mixed_ints = ints_data['tmi']
+    true_gps_ints = ints_data['tgi']
+    ref_gps = ints_data['ref']
+    
+    gps_t = int(utc2gps(utc_t))
+    key = str(float(gps_t))
+    if not (key in true_gps_ints.keys() or key in true_mixed_ints.keys()):
+        return None, None
+    true_gps_ints_t = true_gps_ints[key]
+    true_gps_ints_t = {int(key[1:-1]): 0.190293*int(true_gps_ints_t[key]) for key in true_gps_ints_t.keys()}
+    true_ints_t = true_gps_ints_t
+    
+    if key in true_mixed_ints.keys():
+        true_mixed_ints_t = true_mixed_ints[key]
+        true_mixed_ints_t = {int(key[1:-1]) + 31: 0.192*int(true_mixed_ints_t[key]) for key in true_mixed_ints_t.keys()}
+        true_ints_t.update(true_mixed_ints_t)
+    
+    if isref:
+        ref_gps_t = int(ref_gps[key])
+    else:
+        ref_gps_t = None
+        
+    return ref_gps_t, true_ints_t
+
+def get_N_hypotheses(utc_t, ints_data, isref=False):
+    mixed_ints = ints_data['mi']
+    gps_ints = ints_data['gi']
+    ref_gps = ints_data['ref']
+    
+    
+    gps_t = int(utc2gps(utc_t))
+    key = str(float(gps_t))
+    if not (key in gps_ints.keys() or key in mixed_ints.keys()):
+        return None, None
+    
+    gps_ints_t = gps_ints[key]
+    
+    if type(list(gps_ints_t.values())[0])==np.ndarray:
+        gps_ints_t = {int(key[1:-1]): [0.190293*int(lkey) for lkey in gps_ints_t[key]] for key in  gps_ints_t.keys()}
+    else:
+        gps_ints_t = {int(key[1:-1]): [0.190293*int(gps_ints_t[key])] for key in gps_ints_t.keys()}
+    
+    ints_t =  gps_ints_t
+    
+    if key in mixed_ints.keys():
+        mixed_ints_t = mixed_ints[key]
+        if type(list(mixed_ints_t.values())[0])==np.ndarray:
+            mixed_ints_t = {int(key[1:-1]) + 31: [0.192*int(lkey) for lkey in mixed_ints_t[key]] for key in  mixed_ints_t.keys()}
+        else:
+            mixed_ints_t = {int(key[1:-1]) + 31: [0.192*int(mixed_ints_t[key])] for key in mixed_ints_t.keys()}
+        ints_t.update( mixed_ints_t)
+    
+    if isref:
+        ref_gps_t = int(ref_gps[key])
+    else:
+        ref_gps_t = None
+        
+    return ref_gps_t, ints_t
 ####################################################################################################################
 # SE(3) ops
 ####################################################################################################################
@@ -293,6 +363,8 @@ def quaternion_multiplication(q1, q2):
     q = L @ q2
     return q / np.linalg.norm(q)
 
+def eul2quat(eul):
+    return tf.matrix_to_quaternion(tf.euler_angles_to_matrix(torch.deg2rad(torch.tensor(eul)), ["X", "Y", "Z"]))
 
 def small_angle_quaternion(dtheta):
     """

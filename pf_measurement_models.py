@@ -17,16 +17,25 @@ class GNSSPFMeasurementModelA(tfilter.base.ParticleFilterMeasurementModelWrapper
         )
         
 class GNSSPFMeasurementModelDD(tfilter.base.ParticleFilterMeasurementModelWrapper):
-    def __init__(self, base_pos, N_dim=0):
+    def __init__(self, *args, **kwargs):
         super().__init__(
-            kalman_filter_measurement_model=GNSSDDKFMeasurementModel(base_pos, N_dim=N_dim)
+            kalman_filter_measurement_model=GNSSDDKFMeasurementModel(*args, **kwargs)
         )
         self.update_sats = self.kalman_filter_measurement_model.update_sats
         
 class GNSSPFMeasurementModel_IMU_DD(tfilter.base.ParticleFilterMeasurementModelWrapper):
-    def __init__(self, base_pos, N_dim=0):
+    def __init__(self, *args, **kwargs):
         super().__init__(
-            kalman_filter_measurement_model=IMUDDMeasurementModel(base_pos, N_dim=N_dim)
+            kalman_filter_measurement_model=IMUDDMeasurementModel(*args, **kwargs)
         )
         self.update_sats = self.kalman_filter_measurement_model.update_sats
         self.update_imu_std = self.kalman_filter_measurement_model.update_imu_std
+        
+class GNSSPFMeasurementModel_IMU_DD_VO(tfilter.base.ParticleFilterMeasurementModelWrapper):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            kalman_filter_measurement_model=IMU_VO_DD_MeasurementModel(*args, **kwargs)
+        )
+        self.update_sats = self.kalman_filter_measurement_model.update_sats
+        self.update_imu_std = self.kalman_filter_measurement_model.update_imu_std
+        self.update_vo_std = self.kalman_filter_measurement_model.update_vo_std
