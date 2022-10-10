@@ -217,7 +217,7 @@ def constructMeasurements_bei(traj1, traj2, date,sort_cn0 = False):
                     carrier2.append(t2_t['L1I'].values[order]) 
                 break
         t_gps.append(timeInGPSWeek(t, date)) 
-    return t_gps, svs, code1, code2, carrier1, carrier2, t_gps
+    return t_gps, svs, code1, code2, carrier1, carrier2, cnos, t_gps
                 
 
 
@@ -315,7 +315,7 @@ def constructMeasurements_gps(traj1, traj2, date,sort_cn0 = False):
                     carrier2.append(t2_t['L1C'].values[order]) 
                 break
         t_gps.append(timeInGPSWeek(t, date)) 
-    return t_gps, svs, code1, code2, carrier1, carrier2, t_gps
+    return t_gps, svs, code1, code2, carrier1, carrier2, cnos, t_gps
 
 def prepareData(t, svs, code1, code2, carrier1, carrier2, eph, 
                 plane=False,ref=0,x0=x0,f=1575.42*10**6,

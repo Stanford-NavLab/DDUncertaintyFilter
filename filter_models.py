@@ -235,17 +235,22 @@ class AsyncParticleFilter(tfilter.filters.ParticleFilter):
         assert self.particle_log_weights.shape == (N, self.num_particles)
 
         return state_estimates
+
+##########################################################################################################################
+# RBPF
+##########################################################################################################################
     
 class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
     """Differentiable RBPF with asynchronous observation and controls forward pass."""
     
-    def attach_ekf(self, dynamics_model, measurement_model: tfilter.base.KalmanFilterMeasurementModel, pf_state_mask):
+    def attach_ekf(self, dynamics_model, measurement_model: tfilter.base.KalmanFilterMeasurementModel, pf_state_mask, bank_mode=False):
         self.ekf = AsyncExtendedKalmanFilter(
                 dynamics_model=dynamics_model,
                 measurement_model=measurement_model,
                 )
         self.pf_state_mask = pf_state_mask
         self.pf_state_dim = torch.sum(pf_state_mask)
+        self.bank_mode = bank_mode
     
     @overrides
     def initialize_beliefs(
@@ -264,21 +269,26 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         assert covariance.shape == (N, self.state_dim, self.state_dim)
         M = self.num_particles
 
-        # Sample particles
-        pf_covariance = torch.eye(self.state_dim).expand(N, self.state_dim, self.state_dim)*1e-6
-        pf_covariance[:, self.pf_state_mask, self.pf_state_mask] = covariance[:, self.pf_state_mask, self.pf_state_mask]
+        # Particle filter uncertainty parameter
+        self.pf_state_uncertainty = 1 - 1e-2
+        self.resample_factor = 0.5
+        self.jitter_dynamics = 1 + 0e-1
         
-        self.particle_states = (
-            torch.distributions.MultivariateNormal(mean, pf_covariance)
+        # Sample particles (assumes pf_state_mask has initial states and kf has later ones)
+        pf_covariance = covariance[:, :self.pf_state_dim, :self.pf_state_dim]
+        
+        particle_states = (
+            torch.distributions.MultivariateNormal(mean[:, :self.pf_state_dim], pf_covariance)
             .sample((M,))
             .transpose(0, 1)
         )
+        
+        self.particle_states = torch.cat((particle_states, mean.expand(N, M, self.state_dim)[:, :, self.pf_state_dim:]), -1)
         assert self.particle_states.shape == (N, M, self.state_dim)
         
         # Initialize EKF with generated particles
-#         kf_covariance = torch.eye(self.state_dim).expand(N*M, self.state_dim, self.state_dim)*1e-6
-#         kf_covariance[:, ~self.pf_state_mask, ~self.pf_state_mask] = covariance[:, ~self.pf_state_mask, ~self.pf_state_mask]
-        kf_covariance = covariance.expand(N*M, self.state_dim, self.state_dim)
+        kf_covariance = self.pf_state_uncertainty*torch.eye(self.state_dim).expand(N*M, self.state_dim, self.state_dim)
+        kf_covariance[:, self.pf_state_dim:, self.pf_state_dim:] =  covariance[:, self.pf_state_dim:, self.pf_state_dim:]
         
         ekf_states = self.particle_states.reshape(-1, self.state_dim)
         self.ekf.initialize_beliefs(mean=ekf_states, covariance=kf_covariance)
@@ -291,6 +301,10 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
 
         # Set initialized flag
         self._initialized = True
+        
+        # EKF covariance reset
+        self.kf_covariance = self.ekf._belief_covariance.detach()
+        self.init_covariance = kf_covariance.detach()
     
     @overrides
     def forward(
@@ -315,21 +329,20 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         # Make sure our particle filter's been initialized
         assert self._initialized, "Particle filter not initialized!"
 
-        self.tmp_outs = []
+        self.tmp_outs = {}
         
         # Get our batch size (N), current particle count (M), & state dimension
         N, M, state_dim = self.particle_states.shape
         assert state_dim == self.state_dim
 
         # Decide whether or not we're resampling
-        resample = self.resample
+        resample = self.resample and not self.bank_mode
         if resample is None:
             # If not explicitly set, we disable resampling in train mode (to allow
             # gradients to propagate through time) and enable in eval mode (to prevent
             # particle deprivation)
             resample = not self.training
 
-        self.tmp_outs.append(resample)
         # If we're not resampling and our current particle count doesn't match
         # our desired particle count, we need to either expand or contract our
         # particle set
@@ -360,6 +373,8 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
                 1, indices[:, :, None].expand((N, M, state_dim))
             )
             self.particle_log_weights = self.particle_log_weights.gather(1, indices)
+            self.kf_covariance = self.kf_covariance.gather(1, indices.reshape(-1)[:, None, None].expand((N*M, state_dim, state_dim)))
+            
             assert self.particle_states.shape == (N, self.num_particles, state_dim)
             assert self.particle_log_weights.shape == (N, self.num_particles)
 
@@ -367,8 +382,9 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
             self.particle_log_weights = self.particle_log_weights - torch.logsumexp(
                 self.particle_log_weights, dim=1, keepdim=True
             )
-        self.tmp_outs.append(self.particle_states)
-        self.tmp_outs.append(self.particle_log_weights)
+        self.tmp_outs['initial states'] = self.particle_states.detach()
+        self.tmp_outs['initial logwt'] = self.particle_log_weights.detach()
+        self.tmp_outs['initial cov'] = self.ekf._belief_covariance.detach()
             
         if controls is not None:
             assert len(fp.utils.SliceWrapper(controls)) == N
@@ -385,29 +401,35 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
                 lambda tensor: torch.repeat_interleave(tensor, repeats=M, dim=0)
             )
             self.ekf._belief_mean = reshaped_states
-#             self.ekf._belief_covariance[:, self.pf_state_mask, self.pf_state_mask] = 0.0
-#             for idx in torch.argwhere(self.pf_state_mask):
-#                 self.ekf._belief_covariance[:, idx, idx] = 1.0
+            
+            if not self.bank_mode:
+                self.ekf._belief_covariance = self.kf_covariance.detach()
+            
             predicted_states = self.ekf(controls=reshaped_controls, observations=None)
             
-            # Find a way to make this apply for general Dynamics models
-            scale_trils = self.dynamics_model.Qxy.expand((N*M, 2, 2))
+            scale_trils = self.jitter_dynamics*self.dynamics_model.calc_Q(dim=self.pf_state_dim).expand((N*M, self.pf_state_dim, self.pf_state_dim))
             
             # Propagate PF state parts
-            self.particle_states = (
-                torch.distributions.MultivariateNormal(
-                    loc=predicted_states[:, :2], scale_tril=scale_trils
+            if self.bank_mode:
+                self.particle_states = predicted_states[:, :self.pf_state_dim]
+            else:
+                self.particle_states = (
+                    torch.distributions.MultivariateNormal(
+                        loc=predicted_states[:, :self.pf_state_dim], scale_tril=scale_trils
+                    )
+                    .rsample()  # Note that we use `rsample` to make sampling differentiable
                 )
-                .rsample()  # Note that we use `rsample` to make sampling differentiable
-            )
             
             # Concatenate with EKF state parts
-            self.particle_states = torch.cat((self.particle_states, predicted_states[:, 2:]), -1).view(N, M, self.state_dim)
+            self.particle_states = torch.cat((self.particle_states, predicted_states[:, self.pf_state_dim:]), -1).view(N, M, self.state_dim)
+            self.kf_covariance = self.ekf._belief_covariance.detach()
+            self.kf_covariance[:, :self.pf_state_dim, :self.pf_state_dim] *= self.pf_state_uncertainty
             
             assert self.particle_states.shape == (N, M, self.state_dim)
 
-        self.tmp_outs.append(self.particle_states)
-        self.tmp_outs.append(self.particle_log_weights)
+            self.tmp_outs['predicted state'] = self.particle_states
+            self.tmp_outs['predicted logwt'] = self.particle_log_weights
+            self.tmp_outs['predicted cov'] = self.ekf._belief_covariance.detach()
         meas_log_wts = None
             
         if observations is not None:
@@ -419,26 +441,14 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
             
             self.ekf._belief_mean = reshaped_states
             
+            self.ekf._belief_covariance = self.kf_covariance.detach()
+            
             corrected_states = self.ekf(controls=None, observations=reshaped_observations)
-            
-            self.particle_states = torch.cat((reshaped_states[:, :2], corrected_states[:, 2:]), -1).reshape(N, M, self.state_dim)
-            
-#             # Sample EKF states for integration
-#             ekf_state_samples = (
-#                 torch.distributions.MultivariateNormal(
-#                     loc=corrected_states[:, :3], scale_tril=torch.tril(self.ekf._belief_covariance[:, :3, :3])
-#                 )
-#                 .sample(sample_shape=(10, ))  # Note that we use `rsample` to make sampling differentiable
-#                 .transpose(0, 1)
-#             )
-            
-#             ekf_state_samples = torch.cat((ekf_state_samples, corrected_states.reshape(-1, 1, self.state_dim).expand(N*M, 10, self.state_dim)[:, :, 3:]), -1).view(N, M*10, self.state_dim)
-            
-#             # Re-weight particles using observations (MC integration across EKF states)
-#             self.particle_log_weights = self.particle_log_weights + torch.logsumexp(self.measurement_model(
-#                 states=ekf_state_samples,
-#                 observations=observations,
-#             ).view(N, M, 10), dim=-1)*0.1
+      
+            # Retain particle states or use full EKF states
+#             self.particle_states = torch.cat((reshaped_states[:, self.pf_state_mask], corrected_states[:, ~self.pf_state_mask]), -1).reshape(N, M, self.state_dim)
+            self.particle_states = corrected_states.reshape(N, M, self.state_dim)
+            self.kf_covariance = self.ekf._belief_covariance.detach()
             
             if self.measurement_model.kalman_filter_measurement_model.mode == "gnss":
                 # Re-weight particles using observations (1-point quadrature)
@@ -447,20 +457,37 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
                     observations=observations,
                 )
                 
-#                 print(meas_log_wts[:, :10])
-
                 self.particle_log_weights = self.particle_log_weights + meas_log_wts + np.log(2)
 
+#                 # Sample EKF states for integration
+#                 N_samples = 10
+                
+#                 ekf_state_samples = (
+#                     torch.distributions.MultivariateNormal(
+#                         loc=corrected_states, scale_tril=torch.tril(self.ekf._belief_covariance)
+#                     )
+#                     .sample(sample_shape=(N_samples, ))  # Note that we use `rsample` to make sampling differentiable
+#                     .transpose(0, 1).transpose(1, 2)
+#                 )
+
+#                 ekf_state_samples = ekf_state_samples.view(N, M*N_samples, self.state_dim)
+
+#                 # Re-weight particles using observations (MC integration across EKF states)
+#                 self.particle_log_weights = self.particle_log_weights + torch.logsumexp(self.measurement_model(
+#                     states=ekf_state_samples,
+#                     observations=observations,
+#                 ).view(N, M, 10), dim=-1)*(1/N_samples)
+                
                 # Normalize particle weights to sum to 1.0
                 self.particle_log_weights = self.particle_log_weights - torch.logsumexp(
                     self.particle_log_weights, dim=1, keepdim=True
                 )
 
-        self.tmp_outs.append(self.particle_states)
-        self.tmp_outs.append(self.particle_log_weights)
-        self.tmp_outs.append(meas_log_wts)
-        self.tmp_outs.append(self.measurement_model.kalman_filter_measurement_model.mode)
-            
+
+                self.tmp_outs['corrected state'] = self.particle_states
+                self.tmp_outs['corrected logwt'] = self.particle_log_weights
+                self.tmp_outs['corrected cov'] = self.ekf._belief_covariance.detach()
+        
         # Compute output
         state_estimates: types.StatesTorch
         if self.estimation_method == "weighted_average":
@@ -469,21 +496,29 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
                 * self.particle_states,
                 dim=1,
             )
+#             robust_weights = torch.exp(self.particle_log_weights).detach().clone()
+#             robust_weights[robust_weights<float(-np.log(M, dtype=np.float32))] = -1e10
+#             robust_weights -= torch.logsumexp(
+#                     robust_weights, dim=1, keepdim=True
+#                 )
+#             state_estimates = torch.sum(
+#                 robust_weights[:, :, np.newaxis]
+#                 * self.particle_states,
+#                 dim=1,
+#             )
         elif self.estimation_method == "argmax":
             best_indices = torch.argmax(self.particle_log_weights, dim=1)
             state_estimates = torch.gather(
-                self.particle_states, dim=1, index=best_indices
-            )
+                self.particle_states, dim=1, index=best_indices.expand(N, 1, state_dim)
+            ).reshape(N, state_dim)
         else:
             assert False, "Unsupported estimation method!"
 
         # Resampling
-        if resample and self.measurement_model.kalman_filter_measurement_model.mode == "gnss":
+        if resample and self.effective_log_sample_size() < np.log(N) + np.log(M) + np.log(self.resample_factor):
             self._resample()
+            self.kf_covariance = self.init_covariance.detach()
             
-        self.tmp_outs.append(self.particle_states)
-        self.tmp_outs.append(self.particle_log_weights)
-
         # Post-condition :)
         assert state_estimates.shape == (N, state_dim)
         assert self.particle_states.shape == (N, self.num_particles, state_dim)
@@ -491,10 +526,25 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
 
         return state_estimates
     
-    def update_sats(self, *args, **kwargs):
-        self.measurement_model.update_sats(*args, **kwargs)
-        self.ekf.measurement_model.update_sats(*args, **kwargs)
+    def effective_log_sample_size(self):
+        return -torch.logsumexp(2*self.particle_log_weights, dim=(0, 1), keepdim=False)
     
-    def update_imu_std(self, AHRS_cov):
-        self.measurement_model.update_imu_std(AHRS_cov)
-        self.ekf.measurement_model.update_imu_std(AHRS_cov)
+    def update_sats(self, *args, pf_std=(None, None, None), kf_std=(None, None, None), **kwargs):
+        self.measurement_model.update_sats(*args, prange_std=pf_std[0], carrier_noN_std=pf_std[1], carrier_N_std=pf_std[2], **kwargs)
+        self.ekf.measurement_model.update_sats(*args, prange_std=kf_std[0], carrier_noN_std=kf_std[1], carrier_N_std=kf_std[2], **kwargs)
+    
+    def update_imu_std(self, *args, **kwargs):
+        self.measurement_model.update_imu_std(*args, **kwargs)
+        self.ekf.measurement_model.update_imu_std(*args, **kwargs)
+        
+    def update_vo_std(self, *args, **kwargs):
+        self.measurement_model.update_vo_std(*args, **kwargs)
+        self.ekf.measurement_model.update_vo_std(*args, **kwargs)
+        
+    def update_dt_cov(self, *args, **kwargs):
+        self.dynamics_model.update_dt_cov(*args, **kwargs)
+        self.ekf.dynamics_model.update_dt_cov(*args, **kwargs)
+    
+    def update_ambiguity_cov(self, *args, **kwargs):
+        self.dynamics_model.update_ambiguity_cov(*args, **kwargs)
+        self.ekf.dynamics_model.update_ambiguity_cov(*args, **kwargs)
