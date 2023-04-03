@@ -1,6 +1,7 @@
 import torchfilter as tfilter
 import torch
 import numpy as np
+import torch.autograd.functional as F
 from utils import *
 
 # (state) -> (observation, observation_noise_covariance)
@@ -44,132 +45,229 @@ class GNSSKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         
         return expected_observation, R
     
+# Measurement model written in torchfilter library for GNSS double difference code and carrier phase measurements
 class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
-    def __init__(self, base_pos, N_dim=0, prange_std=5.0, carrier_noN_std=5.0, carrier_N_std=0.5):
-        super().__init__(state_dim=10 + N_dim, observation_dim=10)
+    def __init__(self, base_pos, N_dim=0, prange_std=5.0, carrier_std=0.1, include_carrier=False, prange_std_tail=None):
+        super().__init__(state_dim=16 + N_dim, observation_dim=10)
+        self.base_pos = base_pos
         self.prange_std = prange_std
-        self.carrier_noN_std = carrier_noN_std
-        self.carrier_N_std = carrier_N_std
-#         self.measurement_std = torch.nn.Parameter(torch.tensor([prange_std, carrier_noN_std]))
-        self.measurement_std = torch.tensor([prange_std, carrier_noN_std])
-        self.satXYZb = None
-        self.idx_code_mask = None
-        self.idx_carr_mask = None                     
-        self.base_pos = torch.tensor(base_pos) 
-         
-    def update_sats(self, satXYZb, idx_code_mask, idx_carr_mask, ref_idx, inter_const_bias=None, N_hypo_dict=None, prange_std=None, carrier_noN_std=None, carrier_N_std=None):
-        self.satXYZb = satXYZb
-        self.idx_code_mask = idx_code_mask
-        self.idx_carr_mask = idx_carr_mask
-        self.code_dim = np.count_nonzero(idx_code_mask)
-        self.carr_dim = np.count_nonzero(idx_carr_mask)
-        self.observation_dim = self.code_dim + self.carr_dim
-        self.ref_idx = ref_idx
-        
-        self.N_allsvs_dd = None
-        if N_hypo_dict is not None:
-            self.N_allsvs_dd = torch.zeros(31+32)
-            for key in N_hypo_dict.keys():
-                self.N_allsvs_dd[key] = N_hypo_dict[key][0]
+        self.carrier_std = carrier_std
+        self.ref_idx = 0
+        self.include_carrier = include_carrier
+        self.include_correntropy = prange_std_tail is not None
+        if self.include_correntropy:
+            self.prange_std_tail = prange_std_tail
             
+
+    def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None):
+        if satXYZb is not None:
+            self.satXYZb = satXYZb
+        if ref_idx is not None:
+            self.ref_idx = ref_idx
         if inter_const_bias is not None:
             self.inter_const_bias = inter_const_bias
         else:
-            self.inter_const_bias = torch.zeros(satXYZb.shape[0])
-            
+            self.inter_const_bias = torch.zeros(self.satXYZb.shape[0])
         if prange_std is not None:
             self.prange_std = prange_std
-            
-        if carrier_noN_std is not None:
-            self.carrier_noN_std = carrier_noN_std
-            
-        if carrier_N_std is not None:
-            self.carrier_N_std = carrier_N_std
-        
+        if carrier_std is not None:
+            self.carrier_std = carrier_std
+        if estimated_N is not None:
+            self.estimated_N = estimated_N
+        else:
+            self.estimated_N = torch.zeros(1, self.satXYZb.shape[0])
+        if idx_code_mask is not None:
+            self.idx_code_mask = idx_code_mask
+        else:
+            self.idx_code_mask = torch.ones(self.satXYZb.shape[0], dtype=torch.bool)
+        if idx_carr_mask is not None:
+            self.idx_carr_mask = idx_carr_mask
+        else:
+            self.idx_carr_mask = torch.ones(self.satXYZb.shape[0], dtype=torch.bool)
+        self.code_dim = torch.sum(self.idx_code_mask)
+        self.carr_dim = torch.sum(self.idx_carr_mask)
+        if self.include_carrier:
+            self.observation_dim = self.code_dim + self.carr_dim
+        else:
+            self.observation_dim = self.code_dim
         
     def forward(self, states):
         N, state_dim = states.shape
-        pos = states[:, :3]
-        if state_dim>10:
-            N_allsvs = states[:, 10:]
-            carrier_std = self.carrier_N_std
+        self.state_dim = state_dim
+
+        pos = states[:, 0:3]
+        expected_observation_code, expected_observation_carr = expected_d_diff(self.satXYZb, states, self.base_pos[None, :], idx_code_mask=self.idx_code_mask, idx_carr_mask=self.idx_carr_mask, ref_idx=self.ref_idx, inter_const_bias=self.inter_const_bias, N_allsvs=self.estimated_N)
+
+        if self.include_carrier:
+            expected_observation = torch.cat((expected_observation_code, expected_observation_carr), dim=1)
         else:
-            N_allsvs = self.N_allsvs_dd
-            carrier_std = self.carrier_noN_std
-            if self.N_allsvs_dd is not None:
-                N_allsvs = N_allsvs.reshape(1, -1).expand(N, 31+32)
-#                 self.measurement_std[1] = self.carrier_N_std
-#                 print(self.N_allsvs_dd)
+            expected_observation = expected_observation_code
 
-        expected_observation_code, expected_observation_carr = expected_d_diff(self.satXYZb, states, self.base_pos[None, :], idx_code_mask=self.idx_code_mask, idx_carr_mask=self.idx_carr_mask, ref_idx=self.ref_idx, inter_const_bias=self.inter_const_bias, N_allsvs=N_allsvs)
-
-        expected_observation = torch.cat((expected_observation_code, expected_observation_carr), -1)
-        
+        # Calculate covariance matrix
         R = torch.ones(self.observation_dim)
-        R[:self.code_dim] = self.prange_std[self.idx_code_mask]
-        R[self.code_dim:] = carrier_std[self.idx_carr_mask]
+        R[:self.code_dim] = self.prange_std
+        if self.include_carrier:
+            R[self.code_dim:] = self.carrier_std
         R = torch.diag(R)
         R = R.expand((N, self.observation_dim, self.observation_dim))
-        
+
         return expected_observation.float(), R.float()
     
 class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, N_dim=0):
-        super().__init__(state_dim=10 + N_dim, observation_dim=4)
-        self.AHRS_cov = torch.eye(4)
+        super().__init__(state_dim=16 + N_dim, observation_dim=4)
+        self.r_std = torch.tensor(np.deg2rad(1.0))
+        self.p_std = torch.tensor(np.deg2rad(1.0))
+        self.y_std = torch.tensor(np.deg2rad(1.0))
          
-    def update_std(self, AHRS_cov):
-        self.AHRS_cov = 0.01*torch.eye(4)
-        self.AHRS_cov[1:, 1:] = 0.01*AHRS_cov
+    def update(self, r_std=None, p_std=None, y_std=None):
+        if r_std is not None:
+            self.r_std = r_std
+        if p_std is not None:
+            self.p_std = p_std
+        if y_std is not None:
+            self.y_std = y_std
+
+#     def covariance(self, quat):
+#         # Return the covariance matrix of the noise.
+#         tmp = quat.detach().clone()
+#         tmp.requires_grad = True
+#         quat_jacobian = F.jacobian(quat2eul, tmp).detach().float()
+# #         print(quat_jacobian)
+        
+#         return torch.matmul(quat_jacobian.transpose(0, 1), torch.diag(torch.stack([self.r_std, self.p_std, self.y_std])).float())
+
+    def cholesky(self):
+        # Return the cholesky matrix of the noise.
+        return torch.diag(torch.stack([(self.r_std + self.p_std + self.y_std)/3, self.r_std, self.p_std, self.y_std])).float()
         
     def forward(self, states):
         N, state_dim = states.shape
-        quat = states[:, 3:7]
+        self.state_dim = state_dim
+
+        quat = states[:, 6:10]
         
-        orientation = tf.quaternion_invert(quat)
+#         quat_hat = torch.mean(quat.detach().clone(), dim=0, keepdim=False)
+#         quat_hat = quat_hat / quat_hat.norm()
         
-        R = self.AHRS_cov.expand((N, self.observation_dim, self.observation_dim))
+#         print("Meas ", self.covariance(quat_hat))
         
-        return orientation.float(), R.float()
+#         R = self.cholesky(quat_hat).expand((N, 4, 3))
+        R = self.cholesky().expand((N, 4, 4))
+        
+        return quat.float(), R.float()
     
 class VOMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, N_dim=0):
-        super().__init__(state_dim=10 + N_dim, observation_dim=3)
-        self.VO_std = 5
+        super().__init__(state_dim=16 + N_dim, observation_dim=3)
+        self.std = torch.tensor(5.0)
+        self.scale = torch.tensor(1.0)
          
-    def update_std(self, std):
-        self.VO_std = std
+    def update(self, std=None, scale=None):
+        if std is not None:
+            self.std = std
+        if scale is not None:
+            self.scale = scale
         
     def forward(self, states):
         N, state_dim = states.shape
         
-        quat = states[:, 3:7].detach()
+        quat = states[:, 6:10].detach().clone()
         quat = torch.div(quat, torch.norm(quat, dim=1)[:, None])
         
-        vel_enu = torch.cat((-states[:, 7:8], states[:, 8:10]), dim=-1)
+        vel_enu = states[:, 3:6]*self.scale
         
-        orientation = tf.quaternion_invert(quat)
-        body_velocity = tf.quaternion_apply(orientation, vel_enu)
+        body_velocity = tf.quaternion_apply(quat, vel_enu)
 #         print(vel_enu[0].detach().numpy(), body_velocity[0].detach().numpy(), orientation[0].detach().numpy())
         
-        R = torch.diag(torch.tensor([1e-5, self.VO_std, 1e-5])).expand((N, self.observation_dim, self.observation_dim))
+        R = torch.diag(torch.stack([torch.tensor(1e-2), self.std, torch.tensor(1e-2)])).expand((N, self.observation_dim, self.observation_dim))
         
         return body_velocity.float(), R.float()
     
+class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
+    def __init__(self, N_dim=0):
+        super().__init__(state_dim=16 + N_dim, observation_dim=1)
+        # Set measurement noise covariance
+        self.landmark_std = torch.tensor(10.0)   # N_landmarks*2
+        self.scale = torch.tensor(0.5)
+
+    def update(self, landmark_std=None, landmarks=None, delta_quat=None, intrinsic=None, scale=None):
+        if landmark_std is not None:
+            self.landmark_std = landmark_std
+        if landmarks is not None:
+            self.landmarks = landmarks
+        if delta_quat is not None:
+            self.delta_quat = delta_quat
+        if intrinsic is not None:
+            self.K = intrinsic
+        if scale is not None:
+            self.scale = scale
+        self.observation_dim = 2*self.landmarks.shape[0]
+        
+    # Generate expected 2d landmark locations from the current state and 3d landmark locations
+    # Input: states: N*state_dim
+    # Output: expected 2d landmark x coordinate: N*N_landmarks
+    #         expected 2d landmark y coordinate: N*N_landmarks
+    #        expected 2d landmark x covariance: N*N_landmarks*N_landmarks
+    #        expected 2d landmark y covariance: N*N_landmarks*N_landmarks
+    def forward(self, states):
+        N, state_dim = states.shape
+        self.state_dim = state_dim
+        
+        # Extract the orientation quaternion from state variables
+        quat = states[:, 6:10].detach().clone()
+        
+        # Normalize the quaternion (world -> body)
+        orientation = torch.div(quat, torch.norm(quat, dim=1)[:, None])
+        # Retrieve the landmark positions in previous frame
+        landmarks = self.landmarks  # N_landmarks*3
+        # Retrieve the change in rotation between frames
+        delta_quat = self.delta_quat  # N*3
+        # relative rotation matrix
+        rmat = tf.quaternion_to_matrix(delta_quat).float().expand(N, 3, 3)
+        # Extract the ENU velocity from state variables
+        vel_enu = states[:, 3:6]*self.scale
+        # Transform the ENU velocity to body frame
+        body_velocity = tf.quaternion_apply(orientation, vel_enu)
+        body_velocity = body_velocity[:, [0, 2, 1]].reshape(N, 3, 1)
+        body_velocity[:, 2, :] = -body_velocity[:, 2, :]
+#         print("body_vel ", body_velocity.reshape(-1))
+        
+        extr = torch.cat([rmat, body_velocity], dim=-1)
+        extr = torch.cat([extr, torch.tensor([[0, 0, 0, 1]]).expand(N, 1, 4)], dim=1)
+        
+        # Calculate intrinsic matrix
+        intr = torch.cat([self.K, torch.zeros(3, 1)], dim=1)
+        intr = torch.cat([intr, torch.tensor([[0, 0, 0, 1]])], dim=0)
+        # Calculate projection matrix
+        proj = torch.bmm(intr.expand(N, 4, 4), extr)   # N*4*4
+        
+        # Convert 3D points to homogeneous coordinates
+        obj_pts = torch.cat([self.landmarks, torch.ones(self.landmarks.shape[0], 1)], dim=1).expand(N, self.landmarks.shape[0], 4)
+        # Project 3D points to image plane
+        img_pts = torch.bmm(proj, obj_pts.transpose(2, 1))
+        img_pts = img_pts[:, :2, :] / img_pts[:, 2:3, :]
+        img_pts = img_pts.transpose(2, 1).reshape(N, -1)  # N*(N_landmarks*2)
+        
+        # Calculate covariance of expected 2d landmark locations
+        R = torch.diag(torch.ones(self.observation_dim)*self.landmark_std).expand((N, self.observation_dim, self.observation_dim))   # N*(N_landmarks*2)*(N_landmarks*2)
+
+        return img_pts.float(), R.float()
+    
 class IMUDDMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, *args, N_dim=0, **kwargs):
-        super().__init__(state_dim=10 + N_dim, observation_dim=14)
+        super().__init__(state_dim=16 + N_dim, observation_dim=14)
         self.imu_model = IMUMeasurementModel(N_dim=N_dim)
         self.gnss_model = GNSSDDKFMeasurementModel(*args, N_dim=N_dim, **kwargs)
         self.mode = "imu"
          
-    def update_imu_std(self,  *args, **kwargs):
-        self.imu_model.update_std( *args, **kwargs)
-        self.observation_dim = 4
+    def update_imu(self,  *args, **kwargs):
+        self.imu_model.update( *args, **kwargs)
+        self.observation_dim = self.imu_model.observation_dim
         self.mode = "imu"
         
-    def update_sats(self,  *args, **kwargs):
-        self.gnss_model.update_sats( *args, **kwargs)
+    def update_gnss(self,  *args, **kwargs):
+        self.gnss_model.update( *args, **kwargs)
         self.observation_dim = self.gnss_model.observation_dim
         self.mode = "gnss"
         
@@ -185,26 +283,36 @@ class IMUDDMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     
 class IMU_VO_DD_MeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, *args, N_dim=0, **kwargs):
-        super().__init__(state_dim=10 + N_dim, observation_dim=14)
+        super().__init__(state_dim=16 + N_dim, observation_dim=14)
         self.imu_model = IMUMeasurementModel(N_dim=N_dim)
-        self.vo_model = VOMeasurementModel(N_dim=N_dim)
+        self.vo_base_model = VOMeasurementModel(N_dim=N_dim)
+        self.vo_model = VOLandmarkMeasurementModel(N_dim=N_dim)
         self.gnss_model = GNSSDDKFMeasurementModel(*args, N_dim=N_dim, **kwargs)
         self.mode = "imu"
          
-    def update_imu_std(self,  *args, **kwargs):
-        self.imu_model.update_std( *args, **kwargs)
+    def update_imu(self,  *args, **kwargs):
+        self.imu_model.update( *args, **kwargs)
         self.observation_dim = self.imu_model.observation_dim
+        self.state_dim = self.imu_model.state_dim
         self.mode = "imu"
         
-    def update_vo_std(self,  *args, **kwargs):
-        self.vo_model.update_std( *args, **kwargs)
+    def update_gnss(self,  *args, **kwargs):
+        self.gnss_model.update( *args, **kwargs)
+        self.observation_dim = self.gnss_model.observation_dim
+        self.state_dim = self.gnss_model.state_dim
+        self.mode = "gnss"
+        
+    def update_vo(self,  *args, **kwargs):
+        self.vo_model.update( *args, **kwargs)
         self.observation_dim = self.vo_model.observation_dim
+        self.state_dim = self.vo_model.state_dim
         self.mode = "vo"
         
-    def update_sats(self,  *args, **kwargs):
-        self.gnss_model.update_sats( *args, **kwargs)
-        self.observation_dim = self.gnss_model.observation_dim
-        self.mode = "gnss"
+    def update_vo_base(self,  *args, **kwargs):
+        self.vo_base_model.update( *args, **kwargs)
+        self.observation_dim = self.vo_base_model.observation_dim
+        self.state_dim = self.vo_base_model.state_dim
+        self.mode = "vo_base"
         
     def forward(self, states):
         N, state_dim = states.shape
@@ -213,6 +321,8 @@ class IMU_VO_DD_MeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             meas, R = self.imu_model(states)
         elif self.mode=="vo":
             meas, R = self.vo_model(states)
+        elif self.mode=="vo_base":
+            meas, R = self.vo_base_model(states)
         elif self.mode=="gnss":
             meas, R = self.gnss_model(states)
         

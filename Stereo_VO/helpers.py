@@ -12,7 +12,7 @@ from itertools import chain, compress
 from scipy.stats import chi2
 
 import os, sys
-sys.path.append('../SuperPoint')
+sys.path.append('/scratch/users/shubhgup/1_18_winter/DDUncertaintyFilter/SuperPoint')
 
 from sp_extractor import *
 

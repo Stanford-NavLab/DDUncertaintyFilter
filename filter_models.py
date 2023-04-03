@@ -50,6 +50,21 @@ class AsyncExtendedKalmanFilter(tfilter.filters.ExtendedKalmanFilter):
         # Return mean
         return self.belief_mean
     
+    def update_gnss(self, *args, **kwargs):
+        self.measurement_model.update_gnss(*args, **kwargs)
+        
+    def update_imu(self, *args, **kwargs):
+        self.measurement_model.update_imu(*args, **kwargs)
+        
+    def update_vo(self, *args, **kwargs):
+        self.measurement_model.update_vo(*args, **kwargs)
+        
+    def update_vo_base(self, *args, **kwargs):
+        self.measurement_model.update_vo_base(*args, **kwargs)
+        
+    def update_dynamics(self, *args, **kwargs):
+        self.dynamics_model.update(*args, **kwargs)
+    
 class AsyncExtendedInformationFilter(tfilter.filters.ExtendedInformationFilter):
     """Differentiable EIF with asynchronous observation and controls forward pass.
 
