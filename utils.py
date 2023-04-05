@@ -1221,18 +1221,19 @@ def imu_predict_and_update(test_filter, lin_acc_t, ang_vel_t, or_quat_t, r_std, 
         r_std=r_std, 
         p_std=p_std, 
         y_std=y_std, 
+        linearization_point=imu_observation[None, :]
     )
 
     # IMU Predict
     estimated_state = test_filter(controls=controls[None, :], observations=None)
 
-    # M-estimation
-    if m_estimation:
-        expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
-        residual = torch.linalg.norm(imu_observation[None, :] - expected_obs)
-        # print("imu_residual ", residual)
-        if residual > imu_robust_threshold:
-            return estimated_state
+    # # M-estimation
+    # if m_estimation:
+    #     expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
+    #     residual = torch.linalg.norm(imu_observation[None, :] - expected_obs)
+    #     # print("imu_residual ", residual)
+    #     if residual > imu_robust_threshold:
+    #         return estimated_state
 
     # IMU Update
     estimated_state = test_filter(controls=None, observations=imu_observation[None, :])
@@ -1257,14 +1258,14 @@ def vo_update(test_filter, estimated_state, landmark_3d, pixel_2d, K, ransac_R, 
 
     test_filter.update_vo_base(std=speed_std, scale=speed_scale)
     
-    # M-estimation
-    if m_estimation:
-        expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
-        # print("expected_obs, vel_meas ", expected_obs, vel_meas)
-        residual = torch.linalg.norm(vel_meas[None, :] - expected_obs)
-        # print("vo_residual ", residual)
-        if residual > vo_robust_threshold:
-            return estimated_state
+    # # M-estimation
+    # if m_estimation:
+    #     expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
+    #     # print("expected_obs, vel_meas ", expected_obs, vel_meas)
+    #     residual = torch.linalg.norm(vel_meas[None, :] - expected_obs)
+    #     # print("vo_residual ", residual)
+    #     if residual > vo_robust_threshold:
+    #         return estimated_state
         
     estimated_state = test_filter(controls=None, observations=vel_meas[None, :])
     
@@ -1276,7 +1277,7 @@ def vo_update(test_filter, estimated_state, landmark_3d, pixel_2d, K, ransac_R, 
 ####################################################################################################################
 
 def gnss_update(test_filter, estimated_state, gnss_observation, satpos, ref, inter_const_bias, idx_code_mask, idx_carr_mask, prange_std, carrier_std, gnss_robust_threshold, m_estimation=True):
-    LARGE_VALUE = 1e5
+    # LARGE_VALUE = 1e5
     
     if gnss_observation is None:
         return estimated_state
@@ -1289,35 +1290,36 @@ def gnss_update(test_filter, estimated_state, gnss_observation, satpos, ref, int
         idx_code_mask=idx_code_mask, 
         idx_carr_mask=idx_carr_mask, 
         prange_std=prange_std,
-        carrier_std=carrier_std
+        carrier_std=carrier_std,
+        linearization_point=gnss_observation[None, :]
         )
 
-    # M-estimation
-    if m_estimation:
-        expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
-        residual = torch.abs(gnss_observation[None, :] - expected_obs)
+    # # M-estimation
+    # if m_estimation:
+    #     expected_obs, R_cholesky = test_filter.measurement_model(estimated_state.detach().clone())        
+    #     residual = torch.abs(gnss_observation[None, :] - expected_obs)
 
-        mean_residual = torch.mean(residual)
-        std_residual = torch.std(residual)
+    #     mean_residual = torch.mean(residual)
+    #     std_residual = torch.std(residual)
         
-        outlier_mask =  residual[0, :] > mean_residual + gnss_robust_threshold*std_residual
-        prange_std_vec = torch.ones(len(gnss_observation))*prange_std
-        carrier_std_vec = torch.ones(len(gnss_observation))*carrier_std
-        prange_std_vec[outlier_mask] = LARGE_VALUE
-        carrier_std_vec[outlier_mask] = LARGE_VALUE
+    #     outlier_mask =  residual[0, :] > mean_residual + gnss_robust_threshold*std_residual
+    #     prange_std_vec = torch.ones(len(gnss_observation))*prange_std
+    #     carrier_std_vec = torch.ones(len(gnss_observation))*carrier_std
+    #     prange_std_vec[outlier_mask] = LARGE_VALUE
+    #     carrier_std_vec[outlier_mask] = LARGE_VALUE
 
 
-        # print('residual', residual)
-        # Update satellite and other context data in the measurement model
-        test_filter.update_gnss(
-            satXYZb=satpos, 
-            ref_idx=ref, 
-            inter_const_bias=inter_const_bias, 
-            idx_code_mask=idx_code_mask, 
-            idx_carr_mask=idx_carr_mask, 
-            prange_std=prange_std_vec,
-            carrier_std=carrier_std_vec
-            )
+        # # print('residual', residual)
+        # # Update satellite and other context data in the measurement model
+        # test_filter.update_gnss(
+        #     satXYZb=satpos, 
+        #     ref_idx=ref, 
+        #     inter_const_bias=inter_const_bias, 
+        #     idx_code_mask=idx_code_mask, 
+        #     idx_carr_mask=idx_carr_mask, 
+        #     prange_std=prange_std_vec,
+        #     carrier_std=carrier_std_vec
+        #     )
 
     # Update step
     estimated_state = test_filter(observations=gnss_observation[None, :], controls=None)

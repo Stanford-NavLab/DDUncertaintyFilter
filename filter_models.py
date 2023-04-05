@@ -258,15 +258,15 @@ class AsyncParticleFilter(tfilter.filters.ParticleFilter):
 class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
     """Differentiable RBPF with asynchronous observation and controls forward pass."""
     
-    def attach_ekf(self, dynamics_model, measurement_model: tfilter.base.KalmanFilterMeasurementModel, pf_state_mask, bank_mode=False):
+    def attach_ekf(self, dynamics_model, measurement_model: tfilter.base.KalmanFilterMeasurementModel, pf_state_mask, mode='redundant'):
         self.ekf = AsyncExtendedKalmanFilter(
                 dynamics_model=dynamics_model,
                 measurement_model=measurement_model,
                 )
         self.pf_state_mask = pf_state_mask
         self.pf_state_dim = torch.sum(pf_state_mask)
-        self.bank_mode = bank_mode
-    
+        self.mode = mode        # ['redundant', 'bank', 'linearization_points', 'naive']
+        
     @overrides
     def initialize_beliefs(
         self, *, mean: types.StatesTorch, covariance: types.CovarianceTorch
@@ -284,8 +284,8 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         assert covariance.shape == (N, self.state_dim, self.state_dim)
         M = self.num_particles
 
-        # Particle filter uncertainty parameter
-        self.pf_state_uncertainty = 1 - 1e-2
+        # Particle filter uncertainty parameters
+        self.pf_state_uncertainty = 1 + 0e-1
         self.resample_factor = 0.5
         self.jitter_dynamics = 1 + 0e-1
         

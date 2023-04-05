@@ -3,9 +3,10 @@ import torch
 import numpy as np
 import torch.autograd.functional as F
 from utils import *
+from robust_cost_models import *
 
 # (state) -> (observation, observation_noise_covariance)
-class MyKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
+class SimpleKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, config):
         super().__init__(state_dim=config.state_dim, observation_dim=config.observation_dim)
         self.H = config.H
@@ -18,7 +19,7 @@ class MyKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         
         return expected_observation, self.R.expand((N, self.observation_dim, self.observation_dim))
     
-    
+# Measurement model written in torchfilter library for GNSS code phase measurements    
 class GNSSKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
     def __init__(self, config):
         super().__init__(state_dim=config.state_dim, observation_dim=config.observation_dim)
@@ -57,9 +58,11 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.include_correntropy = prange_std_tail is not None
         if self.include_correntropy:
             self.prange_std_tail = prange_std_tail
+        self.linearization_point = None
+        self.robust_cost_model = MEstimationModel(threshold=10.0)
             
 
-    def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None):
+    def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None, linearization_point=None):
         if satXYZb is not None:
             self.satXYZb = satXYZb
         if ref_idx is not None:
@@ -90,7 +93,26 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             self.observation_dim = self.code_dim + self.carr_dim
         else:
             self.observation_dim = self.code_dim
+        if linearization_point is not None:
+            self.linearization_point = linearization_point
         
+    def robust_cost_cholesky(self, observation, expected_observation):
+        with torch.no_grad():
+            residual = observation - expected_observation
+            residual[:, :self.code_dim] = residual[:, :self.code_dim]/self.prange_std
+            residual[:, self.code_dim:] = residual[:, self.code_dim:]/self.carrier_std
+            outlier_mask = self.robust_cost_model.generate_outlier_mask(residual)
+            
+        N, _ = residual.shape
+        R = torch.ones(N, self.observation_dim)
+        R[:, :self.code_dim] = self.prange_std
+        R[:, self.code_dim:] = self.carrier_std
+        R[outlier_mask] = 1e6
+        R = torch.diag_embed(R)
+
+        return R
+
+
     def forward(self, states):
         N, state_dim = states.shape
         self.state_dim = state_dim
@@ -104,12 +126,9 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             expected_observation = expected_observation_code
 
         # Calculate covariance matrix
-        R = torch.ones(self.observation_dim)
-        R[:self.code_dim] = self.prange_std
-        if self.include_carrier:
-            R[self.code_dim:] = self.carrier_std
-        R = torch.diag(R)
-        R = R.expand((N, self.observation_dim, self.observation_dim))
+        if self.linearization_point is None:
+            self.linearization_point = expected_observation
+        R = self.robust_cost_cholesky(self.linearization_point, expected_observation)
 
         return expected_observation.float(), R.float()
     
@@ -119,27 +138,55 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.r_std = torch.tensor(np.deg2rad(1.0))
         self.p_std = torch.tensor(np.deg2rad(1.0))
         self.y_std = torch.tensor(np.deg2rad(1.0))
+        self.linearization_point = None
+        self.robust_cost_model = MEstimationModel(threshold=5.0, debug=True)
          
-    def update(self, r_std=None, p_std=None, y_std=None):
+    def update(self, r_std=None, p_std=None, y_std=None, linearization_point=None):
         if r_std is not None:
             self.r_std = r_std
         if p_std is not None:
             self.p_std = p_std
         if y_std is not None:
             self.y_std = y_std
+        if linearization_point is not None:
+            self.linearization_point = linearization_point
 
-#     def covariance(self, quat):
-#         # Return the covariance matrix of the noise.
-#         tmp = quat.detach().clone()
-#         tmp.requires_grad = True
-#         quat_jacobian = F.jacobian(quat2eul, tmp).detach().float()
-# #         print(quat_jacobian)
+    def cholesky(self, quat):
+        # Return the covariance matrix of the noise.
+        with torch.enable_grad():
+            tmp = quat.detach().clone()
+            N, _ = tmp.shape
+            tmp = tmp[:, None, :].expand((N, 3, 4))
+            tmp.requires_grad = True
+            eul = quat2eul(tmp.reshape(-1, 4)).reshape(N, -1, 3)
+            mask = torch.eye(3, device=eul.device).repeat(N, 1, 1)
+            quat_jacobian = torch.autograd.grad(eul, tmp, mask, create_graph=False)[0].detach().float()
+            quat_jacobian = quat_jacobian.transpose(1, 2)
+            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0))])).float())
+            ret_chol = torch.linalg.norm(ret_chol, dim=2)
+            ret_chol = torch.diag_embed(ret_chol)
+        return ret_chol
+    
+    def robust_cost_cholesky(self, observation, expected_observation):
+        base_R = self.cholesky(expected_observation)
         
-#         return torch.matmul(quat_jacobian.transpose(0, 1), torch.diag(torch.stack([self.r_std, self.p_std, self.y_std])).float())
+        with torch.no_grad():
+            residual = observation - expected_observation
+            N, _ = residual.shape
+            # normalize residual based on covariance base_R
+            residual = (residual[:, None, :] @ torch.linalg.inv(base_R)).reshape(N, -1)
 
-    def cholesky(self):
-        # Return the cholesky matrix of the noise.
-        return torch.diag(torch.stack([(self.r_std + self.p_std + self.y_std)/3, self.r_std, self.p_std, self.y_std])).float()
+            outlier_mask = self.robust_cost_model.generate_outlier_mask(residual)
+        
+        R = torch.diagonal(base_R, dim1=-2, dim2=-1)
+        R[outlier_mask] = 10
+        R = torch.diag_embed(R)
+        
+        return R
+
+    # def cholesky(self):
+    #     # Return the cholesky matrix of the noise.
+    #     return torch.diag(torch.stack([(self.r_std + self.p_std + self.y_std)/3, self.r_std, self.p_std, self.y_std])).float()
         
     def forward(self, states):
         N, state_dim = states.shape
@@ -152,8 +199,10 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         
 #         print("Meas ", self.covariance(quat_hat))
         
-#         R = self.cholesky(quat_hat).expand((N, 4, 3))
-        R = self.cholesky().expand((N, 4, 4))
+        R = self.robust_cost_cholesky(self.linearization_point, quat)
+        # R = self.cholesky(quat)
+        # R = self.cholesky().expand((N, 4, 4))
+
         
         return quat.float(), R.float()
     

@@ -137,11 +137,17 @@ class QuaternionOrientationModel(tfilter.base.DynamicsModel):
 
     def cholesky(self, quat):
         # Return the covariance matrix of the noise.
-        tmp = quat.detach().clone()
-        tmp.requires_grad = True
-        quat_jacobian = F.jacobian(quat2eul, tmp).detach().float()
-        
-        return torch.matmul(quat_jacobian.transpose(0, 1), torch.diag(torch.stack([self.r_std, self.p_std, self.y_std])).float())
+        with torch.enable_grad():
+            tmp = quat.detach().clone()
+            N, _ = tmp.shape
+            tmp = tmp[:, None, :].expand((N, 3, 4))
+            tmp.requires_grad_(True)
+            eul = quat2eul(tmp.reshape(-1, 4)).reshape(N, -1, 3)
+            mask = torch.eye(3, device=eul.device).repeat(N, 1, 1)
+            quat_jacobian = torch.autograd.grad(eul, tmp, mask, create_graph=False)[0].detach().float()
+            quat_jacobian = quat_jacobian.transpose(1, 2)
+            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0))])).float())
+        return ret_chol
 
     def forward(self, initial_states, controls):
         # The dynamics model is a simple constant angular velocity model.
@@ -150,16 +156,16 @@ class QuaternionOrientationModel(tfilter.base.DynamicsModel):
         assert self.state_dim == state_dim
 
         quat_dot = compute_quat_dot(initial_states, controls)
-
+        
         quat = initial_states + quat_dot*self.dt
         quat = quat / quat.norm(dim=1, keepdim=True)
 
-        quat_hat = torch.mean(quat.detach().clone(), dim=0, keepdim=False)
-        quat_hat = quat_hat / quat_hat.norm()
+        # quat_hat = torch.mean(quat.detach().clone(), dim=0, keepdim=False)
+        # quat_hat = quat_hat / quat_hat.norm()
         
 #         print("Dynamics ", self.covariance(quat_hat))
 
-        return quat, self.cholesky(quat_hat).expand((N, 4, 3))
+        return quat, self.cholesky(quat)
 
 class AmbiguityModel(tfilter.base.DynamicsModel):
     def __init__(self, state_dim=1, dt = 0.0025):
