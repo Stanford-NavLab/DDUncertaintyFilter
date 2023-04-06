@@ -1373,3 +1373,63 @@ def gen_measurement_losses(test_filter, jitter=1e-4):
         return -dist.log_prob(torch.tensor(gt_pos))
 
     return imu_measurement_loss, vo_measurement_loss, gnss_measurement_loss, supervised_position_loss
+
+
+
+
+####################################################################################################################
+# Uncertainty Modules
+####################################################################################################################
+
+def compute_tau_bisection(epsilon, diff_xh_xi, weights, init_tau=30.0):
+    tau = init_tau
+    
+    for _ in range(20): 
+        is_inside = diff_xh_xi < tau
+        filter_integral = torch.sum(weights[is_inside])
+        if filter_integral < 1 - epsilon:
+            tau = 3/2 * tau
+        else:
+            tau = 1/2 * tau
+            
+    return tau
+
+def compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights):
+    sigma = torch.sqrt(torch.sum(weights * torch.square(diff_xh_xi))) + 1e-6
+    return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
+
+def compute_tau_sigma(epsilon, var, weights):
+    sigma = torch.sqrt(torch.sum(weights * var)) + 1e-6
+    return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
+
+def integrate_beliefs_1d(estimated_state, all_hypo_log_weights, all_hypo_states, all_hypo_cov, epsilon=0.01, dim=0):
+    if len(all_hypo_states.shape)==2:
+        all_hypo_states = all_hypo_states[None, :, :]
+        all_hypo_log_weights = all_hypo_log_weights[None, :]
+        all_hypo_cov = all_hypo_cov[None, :, :, :]
+    
+    num_hypo = all_hypo_log_weights.shape[0]
+    
+#     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim])
+    all_hypo_tau = torch.tensor([compute_tau_sigma(epsilon, all_hypo_cov[0, i, dim, dim], 1.0) for i in range(all_hypo_states.shape[1])])
+    diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + all_hypo_tau[None, :]
+    print(all_hypo_tau, torch.sqrt(all_hypo_cov[:, :, dim, dim]))
+#     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + torch.sqrt(all_hypo_cov[:, :, dim, dim])
+    
+    weights = torch.exp(all_hypo_log_weights)
+    
+#     diff_atau_xi = torch.abs(estimated_state[dim] + tau - all_hypo_states[:, :, dim])
+#     diff_btau_xi = torch.abs(estimated_state[dim] - tau - all_hypo_states[:, :, dim])
+    
+#     diff_ptau_xi = torch.maximum(diff_atau_xi, diff_btau_xi)
+#     diff_mtau_xi = torch.minimum(diff_atau_xi, diff_btau_xi)
+    
+    tau = compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights)
+#     tau = compute_tau_sigma(epsilon, all_hypo_cov[:, :, dim, dim], weights)
+
+    #     sigma = 5.0 # all_hypo_cov[:, :, dim, dim]
+    #     integral_xh_xi = torch.erf(diff_xh_xi/sigma)
+    #     integral_ptau_xi = torch.erf(diff_ptau_xi/sigma)
+    #     integral_mtau_xi = torch.erf(diff_mtau_xi/sigma)
+
+    return tau
