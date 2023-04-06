@@ -1374,9 +1374,6 @@ def gen_measurement_losses(test_filter, jitter=1e-4):
 
     return imu_measurement_loss, vo_measurement_loss, gnss_measurement_loss, supervised_position_loss
 
-
-
-
 ####################################################################################################################
 # Uncertainty Modules
 ####################################################################################################################
@@ -1433,3 +1430,156 @@ def integrate_beliefs_1d(estimated_state, all_hypo_log_weights, all_hypo_states,
     #     integral_mtau_xi = torch.erf(diff_mtau_xi/sigma)
 
     return tau
+
+####################################################################################################################
+# Visualization Ops
+####################################################################################################################
+
+
+def visualize_particle_distribution(recorded_data, timestep, sync_gt):
+    get_error = lambda x, timestep: torch.norm(x[0, :, :3] - sync_gt[timestep], dim=-1) 
+
+    # Initial -> Predict
+    plt.hist(get_error(recorded_data[timestep][0]['initial states'], timestep).numpy(), color='r', alpha=0.5, label='initial errors')
+    plt.hist(get_error(recorded_data[timestep][0]['predicted state'], timestep).numpy(), color='g', alpha=0.5, label='predict errors')
+    plt.legend()
+    plt.show()
+
+    plt.bar(get_error(recorded_data[timestep][0]['initial states'], timestep).numpy(), torch.exp(recorded_data[timestep][0]['initial logwt'][0, :]).numpy(), width=0.3, color='r', alpha=0.3, label='initial weights')
+    plt.bar(get_error(recorded_data[timestep][0]['predicted state'], timestep).numpy(), torch.exp(recorded_data[timestep][0]['predicted logwt'][0, :]).numpy(), width=0.3, color='g', alpha=0.3, label='predicted weights')
+    plt.legend()
+    plt.show()
+
+    # Predict -> Update
+    if recorded_data[timestep][1] is not None:
+        plt.hist(get_error(recorded_data[timestep][1]['initial states'], timestep).numpy(), color='g', alpha=0.5, label='predict errors')
+        plt.hist(get_error(recorded_data[timestep][1]['corrected state'], timestep).numpy(), color='b', alpha=0.5, label='correct errors')
+        plt.legend()
+        plt.show()
+        
+        plt.bar(get_error(recorded_data[timestep][1]['initial states'], timestep).numpy(), torch.exp(recorded_data[timestep][1]['initial logwt'][0, :]).numpy(), width=0.3, color='g', alpha=0.3, label='predicted weights')
+        plt.bar(get_error(recorded_data[timestep][1]['corrected state'], timestep).numpy(), torch.exp(recorded_data[timestep][1]['corrected logwt'][0, :]).numpy(), width=0.3, color='b', alpha=0.3, label='corrected weights')
+        plt.legend()
+        plt.show()
+
+def plot_position_estimates(estimated_states, gt_pos, T_start, tmax, imu_to_gt_idx, IMU_rate_div):
+    state_range = range(T_start, tmax, IMU_rate_div)
+    num_elem = len(state_range)
+
+    lower_gt = imu_to_gt_idx(T_start)
+    upper_gt = imu_to_gt_idx(tmax)
+
+    gt_len = upper_gt-lower_gt
+
+    states = estimated_states.detach()
+    plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 0], "r", label="estimated_x")
+    plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 1], "b", label="estimated_y")
+    plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 2], "g", label="estimated_z")
+
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 0], "r--", label="gt_x")
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 1], "b--", label="gt_y")
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 2], "g--", label="gt_z")
+
+    # plt.plot(gt_pos[lower_t_s-root_t_s:, 0], "r--", label="gt_x")
+    # plt.plot(gt_pos[lower_t_s-root_t_s:, 1], "b--", label="gt_y")
+    # plt.plot(gt_pos[lower_t_s-root_t_s:, 2], "g--", label="gt_z")
+
+    plt.xlabel("time [s]")
+    plt.ylabel("position [m]")
+
+    plt.legend()
+
+def plot_orientation_estimates(states, state_range, gt_rot, gt_range):
+    state_or_eul = np.stack(list(quaternion_to_euler_angle_vectorized(states[state_range, 6], states[state_range, 7], states[state_range, 8], states[state_range, 9])), 1)
+    viz_block = range(0, len(state_or_eul))
+    
+    plt.plot(state_or_eul[viz_block, 0], "r", label="estimated roll")
+    plt.plot(state_or_eul[viz_block, 1], "b", label="estimated pitch")
+    plt.plot(state_or_eul[viz_block, 2], "g", label="estimated yaw")
+    
+    plt.plot(gt_rot[gt_range, 0], "r--", label="gt roll")
+    plt.plot(gt_rot[gt_range, 1], "b--", label="gt pitch")
+    plt.plot(gt_rot[gt_range, 2], "g--", label="gt yaw")
+
+    plt.xlabel("time [s]")
+    plt.ylabel("orientation [deg]")
+
+    plt.legend()
+
+def plot_velocity_estimates(states, state_range, gt_pos, gt_range):
+    state_vel = states[state_range, 3:6].numpy()
+
+    viz_block_kHz = range(0, len(state_vel))
+    plt.plot(np.linspace(0, 100, num=len(viz_block_kHz)), state_vel[viz_block_kHz, 0], "r", label="estimated vx")
+    plt.plot(np.linspace(0, 100, num=len(viz_block_kHz)), state_vel[viz_block_kHz, 1], "b", label="estimated vy")
+    plt.plot(np.linspace(0, 100, num=len(viz_block_kHz)), state_vel[viz_block_kHz, 2], "g", label="estimated vz")
+
+    plt.plot(np.linspace(0, 100, num=len(gt_range)-1), np.ediff1d(gt_pos[gt_range, 0]), "r--", label="gt vx")
+    plt.plot(np.linspace(0, 100, num=len(gt_range)-1), np.ediff1d(gt_pos[gt_range, 1]), "b--", label="gt vy")
+    plt.plot(np.linspace(0, 100, num=len(gt_range)-1), np.ediff1d(gt_pos[gt_range, 2]), "g--", label="gt vz")
+
+    plt.xlabel("time [s]")
+    plt.ylabel("velocity [m/s]")
+
+    plt.legend()
+
+def plot_tracking_error(estimated_states, gt_pos, state_range, imu_to_gt_idx):
+    gt_range = [imu_to_gt_idx(t) for t in state_range]
+
+    tracking_error = torch.norm(estimated_states[state_range, :2] - gt_pos[gt_range, :2], dim=1)
+    print("Mean tracking error: ", torch.mean(tracking_error))
+    plt.figure()
+    plt.plot(tracking_error)
+    plt.figure()
+    plt.hist(tracking_error)
+
+def visualize_ekf_covariance(test_filter):
+    plt.imshow(test_filter._belief_covariance[0, :, :])
+    # plt.imshow(test_filter._belief_covariance[0, :, :])
+    plt.colorbar()
+    # torch.linalg.cond(test_filter.ekf._belief_covariance[0, :3, :3])
+
+def plot_trajectory(states, state_range, gt_pos, gt_range):
+    plt.figure()
+    plt.plot(states[state_range, 0], states[state_range, 1])
+    plt.plot(gt_pos[gt_range, 0], gt_pos[gt_range, 1], "r--")
+    plt.xlabel("x [m]")
+    plt.ylabel("y [m]")
+    plt.legend(["estimated", "ground truth"])
+
+
+def visualize_error_bounds(xh, gt, nul, eul, t_s, root_t_s, lower_t_s, upper_t_s, lower_gt, upper_gt):
+    run_x_hat = torch.stack(xh)
+    run_gt = torch.stack(gt)
+
+    overall_pe = torch.norm((run_x_hat[:, :2]-run_gt[:, :2]), dim=1)
+    overall_ul = torch.maximum(torch.stack(nul), torch.stack(eul))
+
+    # mask = overall_ul>50.0
+
+    # run_x_hat[mask] = np.nan
+    # run_gt[mask] = np.nan
+    # overall_pe[mask] = np.nan
+    # overall_ul[mask] = 50.0
+
+    # print(torch.sum((overall_ul<overall_pe)&(overall_pe>15.0))/len(overall_pe))
+
+    def visualize_1d_error_bound(dim, title):
+        plt.figure(figsize=(8, 8))
+        plt.xlabel("Position Error [m]")
+        plt.ylabel("Error bound [m]")
+        plt.scatter(overall_pe, overall_ul, color='k', s=3)
+        plt.plot([0, 50], [0, 50], 'r--')
+        plt.xlim([0, 50])
+        plt.ylim([0, 50])
+
+        plt.fill_between(range(len(run_gt)), run_x_hat[:, dim] - overall_ul, run_x_hat[:, dim] + overall_ul, color='g', alpha=0.5, label=title)
+        # plt.plot(run_x_hat[:, dim], 'r', label='State Estimate')
+        plt.plot(run_gt[:, dim], 'r--', label='Ground Truth')
+
+
+        plt.legend()
+
+    visualize_1d_error_bound(0, "North Error Bound")
+    visualize_1d_error_bound(1, "East Error Bound")
+    visualize_1d_error_bound(2, "Up Error Bound")
