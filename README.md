@@ -8,7 +8,7 @@ This project provides a modular, auto-differentiable, and parallelizable codebas
 - Auto-differentiation for efficient computation of gradients
 - Parallelizable implementation for faster performance
 - Multiple sensor, dynamics, and filter modules included
-- Dedicated uncertainty characterization for accurate state estimation
+- Dedicated uncertainty characterization and error bound calculation
 
 ## Usage
 
