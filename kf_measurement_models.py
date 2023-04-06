@@ -59,7 +59,7 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         if self.include_correntropy:
             self.prange_std_tail = prange_std_tail
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=10.0)
+        self.robust_cost_model = MEstimationModel(threshold=20.0)
             
 
     def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None, linearization_point=None):
@@ -162,7 +162,7 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             mask = torch.eye(3, device=eul.device).repeat(N, 1, 1)
             quat_jacobian = torch.autograd.grad(eul, tmp, mask, create_graph=False)[0].detach().float()
             quat_jacobian = quat_jacobian.transpose(1, 2)
-            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0))])).float())
+            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([self.r_std, self.p_std, self.y_std])).float())
             ret_chol = torch.linalg.norm(ret_chol, dim=2)
             ret_chol = torch.diag_embed(ret_chol)
         return ret_chol
@@ -238,28 +238,46 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         super().__init__(state_dim=16 + N_dim, observation_dim=1)
         # Set measurement noise covariance
         self.landmark_std = torch.tensor(10.0)   # N_landmarks*2
-        self.scale = torch.tensor(0.5)
+        self.scale = torch.tensor(1.0)
+        self.linearization_point = None
+        self.robust_cost_model = MEstimationModel(threshold=10.0, debug=False)
 
-    def update(self, landmark_std=None, landmarks=None, delta_quat=None, intrinsic=None, scale=None):
+    def update(self, landmark_std=None, landmarks=None, intrinsic=None, scale=None, prev_state=None, linearization_point=None):
         if landmark_std is not None:
             self.landmark_std = landmark_std
         if landmarks is not None:
             self.landmarks = landmarks
-        if delta_quat is not None:
-            self.delta_quat = delta_quat
         if intrinsic is not None:
             self.K = intrinsic
         if scale is not None:
             self.scale = scale
+        if prev_state is not None:
+            self.prev_state = prev_state
+        if linearization_point is not None:
+            self.linearization_point = linearization_point
         self.observation_dim = 2*self.landmarks.shape[0]
         
-    # Generate expected 2d landmark locations from the current state and 3d landmark locations
-    # Input: states: N*state_dim
-    # Output: expected 2d landmark x coordinate: N*N_landmarks
-    #         expected 2d landmark y coordinate: N*N_landmarks
-    #        expected 2d landmark x covariance: N*N_landmarks*N_landmarks
-    #        expected 2d landmark y covariance: N*N_landmarks*N_landmarks
+    
+    def robust_cost_cholesky(self, observation, expected_observation):
+        with torch.no_grad():
+            residual = observation - expected_observation
+            residual = residual/self.landmark_std
+            outlier_mask = self.robust_cost_model.generate_outlier_mask(residual)
+            
+        N, _ = residual.shape
+        R = torch.ones(N, self.observation_dim)*self.landmark_std
+        R[outlier_mask] = 1e6
+        R = torch.diag_embed(R)
+
+        return R
+    
     def forward(self, states):
+        # Generate expected 2d landmark locations from the current state and 3d landmark locations
+        # Input: states: N*state_dim
+        # Output: expected 2d landmark x coordinate: N*N_landmarks
+        #         expected 2d landmark y coordinate: N*N_landmarks
+        #        expected 2d landmark x covariance: N*N_landmarks*N_landmarks
+        #        expected 2d landmark y covariance: N*N_landmarks*N_landmarks
         N, state_dim = states.shape
         self.state_dim = state_dim
         
@@ -270,19 +288,25 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         orientation = torch.div(quat, torch.norm(quat, dim=1)[:, None])
         # Retrieve the landmark positions in previous frame
         landmarks = self.landmarks  # N_landmarks*3
-        # Retrieve the change in rotation between frames
-        delta_quat = self.delta_quat  # N*3
+        
+        # Previous quaternion
+        prev_quat = self.prev_state[:, 6:10].detach().clone()
+        
+        # Compute the change in rotation between frames (TODO: unit test this)
+        # delta_quat = quat_delta(prev_quat, quat)  # N*3
+        delta_quat = quat_delta(quat, quat)
         # relative rotation matrix
         rmat = tf.quaternion_to_matrix(delta_quat).float().expand(N, 3, 3)
-        # Extract the ENU velocity from state variables
-        vel_enu = states[:, 3:6]*self.scale
-        # Transform the ENU velocity to body frame
+        # Compute the ENU motion from state variables
+        vel_enu = (states[:, :3]-self.prev_state[:, :3])*self.scale
+        # Transform the ENU velocity to body frame in camera reference
         body_velocity = tf.quaternion_apply(orientation, vel_enu)
         body_velocity = body_velocity[:, [0, 2, 1]].reshape(N, 3, 1)
         body_velocity[:, 2, :] = -body_velocity[:, 2, :]
-#         print("body_vel ", body_velocity.reshape(-1))
+        # body_velocity[:, :2, :] = 0.0
         
         extr = torch.cat([rmat, body_velocity], dim=-1)
+        # print(extr[0].detach().numpy())
         extr = torch.cat([extr, torch.tensor([[0, 0, 0, 1]]).expand(N, 1, 4)], dim=1)
         
         # Calculate intrinsic matrix
@@ -299,7 +323,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         img_pts = img_pts.transpose(2, 1).reshape(N, -1)  # N*(N_landmarks*2)
         
         # Calculate covariance of expected 2d landmark locations
-        R = torch.diag(torch.ones(self.observation_dim)*self.landmark_std).expand((N, self.observation_dim, self.observation_dim))   # N*(N_landmarks*2)*(N_landmarks*2)
+        R = self.robust_cost_cholesky(self.linearization_point, img_pts)   # N*(N_landmarks*2)*(N_landmarks*2)
 
         return img_pts.float(), R.float()
     

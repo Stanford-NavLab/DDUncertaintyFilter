@@ -1128,31 +1128,33 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             'last_update_gnss': -1,  # Last GNSS idx data was added to the data structure
             'last_update_gt': -1,  # Last GT idx data was added to the data structure
             'estimated_states': [], # Tracked estimates of states
+            'estimated_states_vo': [], # Tracked estimates of states at VO rate
         }
 
         recorded_data['dynamics_parameters'].append(dict(
-            pos_x_std=5.109628, 
-            pos_y_std=5.436571, 
+            pos_x_std=3.0292625, 
+            pos_y_std=3.8049316, 
             pos_z_std=1e-3, 
-            vel_x_std=0.313416, 
-            vel_y_std=2.103889, 
+            vel_x_std=4.1566424, 
+            vel_y_std=6.3821898, 
             vel_z_std=1e-4, 
-            r_std=np.deg2rad(0.1), 
-            p_std=np.deg2rad(0.1), 
+            r_std=np.deg2rad(1.0), 
+            p_std=np.deg2rad(1.0), 
             y_std=np.deg2rad(15.0), 
             acc_bias_std=1e-2, 
             gyr_bias_std=np.deg2rad(3.0)
         ))
         
         recorded_data['observation_parameters'].append(dict(
-            r_std=0.0010, 
-            p_std=0.0012, 
-            y_std=0.236015,
+            r_std=np.deg2rad(1.0), 
+            p_std=np.deg2rad(1.0), 
+            y_std=np.deg2rad(1.0),
             imu_robust_threshold=0.7,
-            speed_std=0.703181,
-            speed_scale=0.6006,
+            speed_std=0.89471227,
+            landmark_std=500.0,
+            speed_scale=0.43497968,
             speed_robust_threshold=5.0,
-            prange_std=3.139834, 
+            prange_std=2.0245316, 
             prange_robust_threshold=3.0,
             carrier_std=10.0,
         ))
@@ -1268,6 +1270,21 @@ def vo_update(test_filter, estimated_state, landmark_3d, pixel_2d, K, ransac_R, 
     #         return estimated_state
         
     estimated_state = test_filter(controls=None, observations=vel_meas[None, :])
+    
+    return estimated_state
+
+def vo_tight_update(test_filter, estimated_state, prev_state, landmark_3d, pixel_2d, K, landmark_std, speed_scale, vo_robust_threshold, vel_scaling_factor=1.0, m_estimation=True):
+    # Update VO model
+    test_filter.update_vo(
+        landmark_std=landmark_std, 
+        landmarks=landmark_3d, 
+        intrinsic=K, 
+        scale=speed_scale, 
+        prev_state=prev_state, 
+        linearization_point=pixel_2d.reshape(1, -1)
+    )
+    
+    estimated_state = test_filter(controls=None, observations=pixel_2d.reshape(1, -1))
     
     return estimated_state
 
@@ -1432,9 +1449,69 @@ def integrate_beliefs_1d(estimated_state, all_hypo_log_weights, all_hypo_states,
     return tau
 
 ####################################################################################################################
+# Parameter optimization ops
+####################################################################################################################
+
+def get_param_dict(param_dict_raw, function_list=None):
+    param_dict = {}
+    for i, (key, value) in enumerate(param_dict_raw.items()):
+        param_dict[key] = value
+        if function_list is not None:
+            if function_list[i] == 'softplus':
+                param_dict[key] = torch.nn.functional.softplus(value)
+    return param_dict
+
+
+
+####################################################################################################################
 # Visualization Ops
 ####################################################################################################################
 
+def print_params(param_dict):
+    # Pretty print each tensor parameter
+    for var_name, var_value in param_dict.items():
+        print(var_name, var_value.detach().numpy())
+
+def plot_parameters(opt_state_dict_list, names=None, window_size=100):
+    # Create large figure
+    plt.figure(figsize=(20, 10))
+    
+    # create color list for plt
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    # Plot all parameters with different colors
+    for i in range(len(opt_state_dict_list[0])-1):
+        param_raw = [par[i] for par in opt_state_dict_list]
+        param_mean = np.convolve(param_raw, np.ones((window_size,))/window_size, mode='valid')
+        plt.plot(param_mean, color=colors[i%len(colors)])
+
+        param_std = np.array([np.std(param_raw[i:i+window_size]) for i in range(len(param_mean))])
+        plt.fill_between(np.arange(len(param_mean)), param_mean-3*param_std, param_mean+3*param_std, alpha=0.3, color=colors[i%len(colors)])
+
+    if names is not None:
+        plt.legend(names)
+    
+    plt.xlabel('Epoch')
+    plt.ylabel('Parameter Value')
+
+def plot_loss(opt_state_dict_list, window_size=100):
+    # Create large figure
+    plt.figure(figsize=(20, 5))
+
+    loss_raw = [par[-1] for par in opt_state_dict_list]
+    # Set outlier loss values to nan
+    loss_raw = np.array(loss_raw)
+    loss_raw[loss_raw>1e3] = np.nan
+    
+    loss_mean = np.array([np.nanmean(loss_raw[i:i+window_size]) for i in range(len(loss_raw)-window_size)])
+    plt.plot(loss_mean)
+
+    # Compute std deviation of loss in window at each epoch
+    loss_std = np.array([np.nanstd(loss_raw[i:i+window_size]) for i in range(len(loss_raw)-window_size)])
+    plt.fill_between(np.arange(len(loss_mean)), loss_mean-0.1*loss_std, loss_mean+0.1*loss_std, alpha=0.3)
+
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
 
 def visualize_particle_distribution(recorded_data, timestep, sync_gt):
     get_error = lambda x, timestep: torch.norm(x[0, :, :3] - sync_gt[timestep], dim=-1) 

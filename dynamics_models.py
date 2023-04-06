@@ -146,7 +146,9 @@ class QuaternionOrientationModel(tfilter.base.DynamicsModel):
             mask = torch.eye(3, device=eul.device).repeat(N, 1, 1)
             quat_jacobian = torch.autograd.grad(eul, tmp, mask, create_graph=False)[0].detach().float()
             quat_jacobian = quat_jacobian.transpose(1, 2)
-            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0)), torch.tensor(np.deg2rad(1.0))])).float())
+            ret_chol = torch.matmul(quat_jacobian, torch.diag(torch.stack([self.r_std, self.p_std, self.y_std])).float())
+            ret_chol = torch.linalg.norm(ret_chol, dim=2)
+            ret_chol = torch.diag_embed(ret_chol)
         return ret_chol
 
     def forward(self, initial_states, controls):
@@ -155,7 +157,8 @@ class QuaternionOrientationModel(tfilter.base.DynamicsModel):
         N, state_dim = initial_states.shape
         assert self.state_dim == state_dim
 
-        quat_dot = compute_quat_dot(initial_states, controls)
+        # quat_dot = compute_quat_dot(initial_states.detach().clone(), controls)
+        quat_dot = torch.zeros_like(initial_states)
         
         quat = initial_states + quat_dot*self.dt
         quat = quat / quat.norm(dim=1, keepdim=True)
@@ -304,10 +307,10 @@ class PosVelQuatBiasModel(tfilter.base.DynamicsModel):
         imu_bias, imu_bias_cov = self.imu_bias_model(initial_states[:,10:], None)
 
         # Combine the covariance matrices
-        cholseky_matrix = torch.zeros((N, 16, 15))
+        cholseky_matrix = torch.zeros((N, 16, 16))
         cholseky_matrix[:, 0:6, 0:6] = pos_vel_cov
-        cholseky_matrix[:, 6:10, 6:9] = quat_cov
-        cholseky_matrix[:, 10:, 9:] = imu_bias_cov
+        cholseky_matrix[:, 6:10, 6:10] = quat_cov
+        cholseky_matrix[:, 10:, 10:] = imu_bias_cov
 
         return torch.cat((pos_vel, quat, imu_bias), axis=1), cholseky_matrix
 
