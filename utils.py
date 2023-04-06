@@ -1530,14 +1530,22 @@ def plot_tracking_error(estimated_states, gt_pos, state_range, imu_to_gt_idx):
     print("Mean tracking error: ", torch.mean(tracking_error))
     plt.figure()
     plt.plot(tracking_error)
+    plt.xlabel("time [s]")
+    plt.ylabel("error [m]")
+    
     plt.figure()
-    plt.hist(tracking_error)
+    plt.hist(tracking_error.numpy().flatten())
+    plt.xlabel("error [m]")
+    plt.ylabel("count")
 
-def visualize_ekf_covariance(test_filter):
+def visualize_ekf_covariance(test_filter, names=None):
     plt.imshow(test_filter._belief_covariance[0, :, :])
     # plt.imshow(test_filter._belief_covariance[0, :, :])
     plt.colorbar()
     # torch.linalg.cond(test_filter.ekf._belief_covariance[0, :3, :3])
+    if names is not None:
+        plt.xticks(range(len(names)), names, rotation=90)
+        plt.yticks(range(len(names)), names)
 
 def plot_trajectory(states, state_range, gt_pos, gt_range):
     plt.figure()

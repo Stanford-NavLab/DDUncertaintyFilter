@@ -139,7 +139,7 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.p_std = torch.tensor(np.deg2rad(1.0))
         self.y_std = torch.tensor(np.deg2rad(1.0))
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=5.0, debug=True)
+        self.robust_cost_model = MEstimationModel(threshold=5.0, debug=False)
          
     def update(self, r_std=None, p_std=None, y_std=None, linearization_point=None):
         if r_std is not None:
@@ -199,8 +199,8 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         
 #         print("Meas ", self.covariance(quat_hat))
         
-        R = self.robust_cost_cholesky(self.linearization_point, quat)
-        # R = self.cholesky(quat)
+        # R = self.robust_cost_cholesky(self.linearization_point, quat)
+        R = self.cholesky(quat)
         # R = self.cholesky().expand((N, 4, 4))
 
         
