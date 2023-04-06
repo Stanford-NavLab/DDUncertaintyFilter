@@ -32,3 +32,6 @@ Please note that this project is released with a Contributor Code of Conduct. By
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
 
+## Note
+
+This codebase is still under construction and may contain bugs or incomplete features. We are actively working on improving the project, and welcome any feedback or contributions to help make it more robust and versatile.
