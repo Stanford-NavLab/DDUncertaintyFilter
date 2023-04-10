@@ -16,6 +16,7 @@ from coordinates import *
 import pymap3d as pm
 import xarray as xr
 from torch.distributions.multivariate_normal import MultivariateNormal
+import pickle
 
 
 # from dynamics_models import *
@@ -411,6 +412,26 @@ def calc_ambiguity_cov(cs_data, idx_carr_mask):
     default_sigma[cs_data==True] = 20.0
     return default_sigma
 
+def load_slam_data(record_path):
+    """Load the SLAM data from a record path.
+
+    Parameters
+    ----------
+    record_path : str
+        The path to the record.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the SLAM keyframe poses.
+
+    """
+    with open(record_path, 'rb') as f:
+        recorded_data = pickle.load(f)
+    slam_data = {}
+    slam_data['estimated_states_vo'] = recorded_data['estimated_states_vo']
+    slam_data['estimated_covariance_vo'] = recorded_data['estimated_covariance_vo']
+    return slam_data
 
 def ahrs_meas_converter(quat):
     tmp_eul = quat2eul(tf.quaternion_invert(quat.detach()))
@@ -1128,15 +1149,17 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             'last_update_gnss': -1,  # Last GNSS idx data was added to the data structure
             'last_update_gt': -1,  # Last GT idx data was added to the data structure
             'estimated_states': [], # Tracked estimates of states
+            'estimated_covariance': [], # Tracked estimates of states
             'estimated_states_vo': [], # Tracked estimates of states at VO rate
+            'estimated_covariance_vo': [], # Tracked estimates of states at VO rate
         }
 
         recorded_data['dynamics_parameters'].append(dict(
-            pos_x_std=3.0292625, 
-            pos_y_std=3.8049316, 
+            pos_x_std=11.43, 
+            pos_y_std=11.13, 
             pos_z_std=1e-3, 
-            vel_x_std=4.1566424, 
-            vel_y_std=6.3821898, 
+            vel_x_std=17.02, 
+            vel_y_std=17.33, 
             vel_z_std=1e-4, 
             r_std=np.deg2rad(1.0), 
             p_std=np.deg2rad(1.0), 
@@ -1150,11 +1173,11 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             p_std=np.deg2rad(1.0), 
             y_std=np.deg2rad(1.0),
             imu_robust_threshold=0.7,
-            speed_std=0.89471227,
-            landmark_std=500.0,
-            speed_scale=0.43497968,
+            speed_std=3.02,
+            landmark_std=2.42,
+            speed_scale=0.20,
             speed_robust_threshold=5.0,
-            prange_std=2.0245316, 
+            prange_std=5.04, 
             prange_robust_threshold=3.0,
             carrier_std=10.0,
         ))
@@ -1273,7 +1296,7 @@ def vo_update(test_filter, estimated_state, landmark_3d, pixel_2d, K, ransac_R, 
     
     return estimated_state
 
-def vo_tight_update(test_filter, estimated_state, prev_state, landmark_3d, pixel_2d, K, landmark_std, speed_scale, vo_robust_threshold, vel_scaling_factor=1.0, m_estimation=True):
+def vo_tight_update(test_filter, estimated_state, prev_state, prev_covariance, landmark_3d, pixel_2d, K, landmark_std, speed_scale, vo_robust_threshold, vel_scaling_factor=1.0, m_estimation=True):
     # Update VO model
     test_filter.update_vo(
         landmark_std=landmark_std, 
@@ -1281,6 +1304,7 @@ def vo_tight_update(test_filter, estimated_state, prev_state, landmark_3d, pixel
         intrinsic=K, 
         scale=speed_scale, 
         prev_state=prev_state, 
+        prev_covariance=prev_covariance,
         linearization_point=pixel_2d.reshape(1, -1)
     )
     
@@ -1370,6 +1394,15 @@ def gen_measurement_losses(test_filter, jitter=1e-4):
         # The loss is the negative log-likelihood of the observation
         return -torch.distributions.Normal(expected_t, sigma).log_prob(torch.tensor(np.linalg.norm(ransac_t)))
     
+    def vo_tight_measurement_loss(pixel_2d, estimated_state):
+        # Measurement likelihood update
+        expected_obs, R_cholesky = test_filter.measurement_model(estimated_state)     
+        R = R_cholesky @ R_cholesky.transpose(-1, -2)
+        dist = MultivariateNormal(expected_obs[0, :], covariance_matrix=jitter*torch.eye(expected_obs.shape[1]) + R[0, :, :])
+
+        # The loss is the negative log-likelihood of the observation
+        return -dist.log_prob(pixel_2d.reshape(-1))
+    
     def gnss_measurement_loss(gnss_observation, estimated_state):
         if gnss_observation is None:
             return 0
@@ -1389,7 +1422,7 @@ def gen_measurement_losses(test_filter, jitter=1e-4):
     #             print(test_filter._belief_covariance[0, 3:6, 3:6])
         return -dist.log_prob(torch.tensor(gt_pos))
 
-    return imu_measurement_loss, vo_measurement_loss, gnss_measurement_loss, supervised_position_loss
+    return imu_measurement_loss, vo_measurement_loss, vo_tight_measurement_loss, gnss_measurement_loss, supervised_position_loss
 
 ####################################################################################################################
 # Uncertainty Modules
@@ -1611,7 +1644,7 @@ def plot_tracking_error(estimated_states, gt_pos, state_range, imu_to_gt_idx):
     plt.ylabel("error [m]")
     
     plt.figure()
-    plt.hist(tracking_error.numpy().flatten())
+    plt.hist(tracking_error.numpy().flatten(), bins=100)
     plt.xlabel("error [m]")
     plt.ylabel("count")
 

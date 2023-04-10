@@ -155,10 +155,10 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         # Return the covariance matrix of the noise.
         with torch.enable_grad():
             tmp = quat.detach().clone()
-            N, _ = tmp.shape
-            tmp = tmp[:, None, :].expand((N, 3, 4))
+            N, D = tmp.shape
+            tmp = tmp[:, None, :].expand((N, 3, D))
             tmp.requires_grad = True
-            eul = quat2eul(tmp.reshape(-1, 4)).reshape(N, -1, 3)
+            eul = quat2eul(tmp.reshape(-1, D)).reshape(N, -1, 3)
             mask = torch.eye(3, device=eul.device).repeat(N, 1, 1)
             quat_jacobian = torch.autograd.grad(eul, tmp, mask, create_graph=False)[0].detach().float()
             quat_jacobian = quat_jacobian.transpose(1, 2)
@@ -202,7 +202,7 @@ class IMUMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         # R = self.robust_cost_cholesky(self.linearization_point, quat)
         R = self.cholesky(quat)
         # R = self.cholesky().expand((N, 4, 4))
-
+        # print(quat, R)
         
         return quat.float(), R.float()
     
@@ -240,9 +240,9 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.landmark_std = torch.tensor(10.0)   # N_landmarks*2
         self.scale = torch.tensor(1.0)
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=10.0, debug=False)
+        self.robust_cost_model = MEstimationModel(threshold=10.0, debug=True)
 
-    def update(self, landmark_std=None, landmarks=None, intrinsic=None, scale=None, prev_state=None, linearization_point=None):
+    def update(self, landmark_std=None, landmarks=None, intrinsic=None, scale=None, prev_state=None, prev_covariance=None, linearization_point=None):
         if landmark_std is not None:
             self.landmark_std = landmark_std
         if landmarks is not None:
@@ -253,12 +253,30 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             self.scale = scale
         if prev_state is not None:
             self.prev_state = prev_state
+        if prev_covariance is not None:
+            self.prev_covariance = prev_covariance
         if linearization_point is not None:
             self.linearization_point = linearization_point
         self.observation_dim = 2*self.landmarks.shape[0]
-        
+
+    def cholesky(self, vel_enu, orientation, rmat):
+        # Return the covariance matrix of the noise.
+        N, _ = vel_enu.shape
+        orientation = orientation[:, None, :].expand((N, self.observation_dim, 4)).reshape(-1, 4)
+        rmat = rmat[:, None, :, :].expand((N, self.observation_dim, 3, 3)).reshape(-1, 3, 3)
+        with torch.enable_grad():
+            tmp = vel_enu.detach().clone()
+            tmp = tmp[:, None, :].expand((N, self.observation_dim, 3))
+            tmp.requires_grad = True
+            img_pts = self._vel_to_2dfeatures(tmp.reshape(-1, 3), orientation, rmat).reshape(N, -1, self.observation_dim)
+            mask = torch.eye(self.observation_dim, device=img_pts.device).repeat(N, 1, 1)
+            feat_jacobian = torch.autograd.grad(img_pts, tmp, mask, create_graph=False)[0].detach().float()
+            ret_chol = torch.matmul(feat_jacobian, self.prev_covariance[0, :3, :3])
+            ret_chol = torch.linalg.norm(ret_chol, dim=2)
+            ret_chol = torch.diag_embed(ret_chol)
+        return ret_chol    
     
-    def robust_cost_cholesky(self, observation, expected_observation):
+    def robust_cost_cholesky(self, observation, expected_observation, vel_enu, orientation, rmat):
         with torch.no_grad():
             residual = observation - expected_observation
             residual = residual/self.landmark_std
@@ -267,10 +285,82 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         N, _ = residual.shape
         R = torch.ones(N, self.observation_dim)*self.landmark_std
         R[outlier_mask] = 1e6
-        R = torch.diag_embed(R)
-
+        R = torch.diag_embed(R) # + self.cholesky(vel_enu, orientation, rmat)
         return R
     
+    def _vel_to_2dfeatures(self, vel_enu, orientation, rmat):
+        N = vel_enu.shape[0]
+        # Transform the ENU velocity to body frame in camera reference
+        cam_velocity = self._enu_to_camera_velocity(vel_enu, orientation, N)
+        
+        extr = self._construct_extrinsics(rmat, cam_velocity, N)
+        
+        # Calculate intrinsic matrix
+        intr = self._construct_intrinsics(self.K)
+        # Calculate projection matrix
+        proj = self._construct_projection(intr, extr, N)
+        
+        # Convert 3D points to homogeneous coordinates
+        obj_pts = self._convert_3d_points_to_homogeneous(self.landmarks, N)
+        # Project 3D points to image plane
+        img_pts = self._project_3d_points_to_image_plane(proj, obj_pts, N)
+
+        return img_pts
+
+    def _enu_to_camera_velocity(self, vel_enu, orientation, N):
+        # Rotate the velocity from ENU to body frame.
+        body_velocity = tf.quaternion_apply(orientation, vel_enu)
+        # Rearrange the axes from (x, y, z) to (x, z, y).
+        # We do this because the camera frame is rotated 90 degrees from
+        # the body frame.
+        cam_velocity = body_velocity[:, [0, 2, 1]].reshape(N, 3, 1)
+        # Flip the sign of the z-axis.
+        # We do this because the camera frame is rotated 180 degrees from
+        # the body frame.
+        cam_velocity[:, 2, :] = -cam_velocity[:, 2, :]
+        # # Zero out the x and y axes.
+        # # We do this because the camera frame is rotated 90 degrees from
+        # # the body frame, so the x and y axes are no longer aligned with
+        # # the body frame.
+        # cam_velocity[:, :2, :] = 0.0
+        return cam_velocity
+
+    def _construct_extrinsics(self, rmat, body_velocity, N):
+        # Concatenate rotation matrix with body velocity
+        extr = torch.cat([rmat, body_velocity], dim=-1)
+        # Add 0, 0, 0, 1 to bottom row of extrinsics matrix
+        extr = torch.cat([extr, torch.tensor([[0, 0, 0, 1]]).expand(N, 1, 4)], dim=1)
+        return extr
+
+    def _construct_intrinsics(self, K):
+        # construct a 4x4 matrix from 3x3 matrix based on the definition of homogenous coordinates
+        intr = torch.cat([K, torch.zeros(3, 1)], dim=1)
+        intr = torch.cat([intr, torch.tensor([[0, 0, 0, 1]])], dim=0)
+        return intr
+
+    def _construct_projection(self, intr, extr, N):
+        # Project 3D points to 2D
+        # intr = intrinsic matrix
+        # extr = extrinsic matrix
+        # N = batch size
+        return torch.bmm(intr.expand(N, 4, 4), extr)
+
+    def _convert_3d_points_to_homogeneous(self, obj_pts, N):
+        # Add z coordinate
+        obj_pts = torch.cat([obj_pts, torch.ones(obj_pts.shape[0], 1)], dim=1)
+        # Add batch dimension
+        obj_pts = obj_pts.expand(N, obj_pts.shape[0], 4)
+        return obj_pts
+
+    def _project_3d_points_to_image_plane(self, proj, obj_pts, N):
+        # project 3d points to image plane
+        img_pts = torch.bmm(proj, obj_pts.transpose(2, 1))
+        # divide by z
+        img_pts = img_pts[:, :2, :] / img_pts[:, 2:3, :]
+        # reshape to N*(N_landmarks*2)
+        img_pts = img_pts.transpose(2, 1).reshape(N, -1)
+        return img_pts
+
     def forward(self, states):
         # Generate expected 2d landmark locations from the current state and 3d landmark locations
         # Input: states: N*state_dim
@@ -299,31 +389,11 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         rmat = tf.quaternion_to_matrix(delta_quat).float().expand(N, 3, 3)
         # Compute the ENU motion from state variables
         vel_enu = (states[:, :3]-self.prev_state[:, :3])*self.scale
-        # Transform the ENU velocity to body frame in camera reference
-        body_velocity = tf.quaternion_apply(orientation, vel_enu)
-        body_velocity = body_velocity[:, [0, 2, 1]].reshape(N, 3, 1)
-        body_velocity[:, 2, :] = -body_velocity[:, 2, :]
-        # body_velocity[:, :2, :] = 0.0
-        
-        extr = torch.cat([rmat, body_velocity], dim=-1)
-        # print(extr[0].detach().numpy())
-        extr = torch.cat([extr, torch.tensor([[0, 0, 0, 1]]).expand(N, 1, 4)], dim=1)
-        
-        # Calculate intrinsic matrix
-        intr = torch.cat([self.K, torch.zeros(3, 1)], dim=1)
-        intr = torch.cat([intr, torch.tensor([[0, 0, 0, 1]])], dim=0)
-        # Calculate projection matrix
-        proj = torch.bmm(intr.expand(N, 4, 4), extr)   # N*4*4
-        
-        # Convert 3D points to homogeneous coordinates
-        obj_pts = torch.cat([self.landmarks, torch.ones(self.landmarks.shape[0], 1)], dim=1).expand(N, self.landmarks.shape[0], 4)
-        # Project 3D points to image plane
-        img_pts = torch.bmm(proj, obj_pts.transpose(2, 1))
-        img_pts = img_pts[:, :2, :] / img_pts[:, 2:3, :]
-        img_pts = img_pts.transpose(2, 1).reshape(N, -1)  # N*(N_landmarks*2)
+        # Calculate expected 2d landmark locations
+        img_pts = self._vel_to_2dfeatures(vel_enu, orientation, rmat)
         
         # Calculate covariance of expected 2d landmark locations
-        R = self.robust_cost_cholesky(self.linearization_point, img_pts)   # N*(N_landmarks*2)*(N_landmarks*2)
+        R = self.robust_cost_cholesky(self.linearization_point, img_pts, vel_enu, orientation, rmat)   # N*(N_landmarks*2)*(N_landmarks*2)
 
         return img_pts.float(), R.float()
     
