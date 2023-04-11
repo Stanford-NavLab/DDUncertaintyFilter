@@ -14,6 +14,7 @@ import pytorch3d.transforms as tf
 from queue import Queue
 from coordinates import *
 import pymap3d as pm
+from tqdm import tqdm
 import xarray as xr
 from torch.distributions.multivariate_normal import MultivariateNormal
 import pickle
@@ -429,8 +430,11 @@ def load_slam_data(record_path):
     with open(record_path, 'rb') as f:
         recorded_data = pickle.load(f)
     slam_data = {}
-    slam_data['estimated_states_vo'] = recorded_data['estimated_states_vo']
-    slam_data['estimated_covariance_vo'] = recorded_data['estimated_covariance_vo']
+    slam_data['estimated_states'] = recorded_data['estimated_states']
+    slam_data['estimated_covariance'] = recorded_data['estimated_covariance']
+    slam_data['imu_times'] = recorded_data['imu_times']
+    # create a precomputed inverse function for the time to index
+    slam_data['time_to_index'] = lambda t: np.searchsorted(slam_data['imu_times'], t, side='left')
     return slam_data
 
 def ahrs_meas_converter(quat):
@@ -1111,20 +1115,26 @@ def inter_const_bias_tensor(dd_data):
 def init_filter_measurement_model(dd_data, N_dim, meas_model):
     return meas_model(dd_data['base_station_enu'].to_numpy(), N_dim=N_dim)
 
-def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start):
+def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start, noisy=False):
     def reset_filter(test_filter, t=T_start):
         # initialize the previous timestamp
         prev_timestamp = timestamp[t] - 0.0025*IMU_rate_div
         
         init_state = torch.zeros(state_dim)
         init_state[:3] = torch.tensor(gt_pos[imu_to_gt_idx(t)])
+        if noisy:
+            init_state[:2] += torch.randn(2)*5.0
         init_state[3:6] = torch.tensor(gt_vel[imu_to_gt_idx(t)])
+        if noisy:
+            init_state[3:5] += torch.randn(2)*0.2
         # init_state[3:6] = torch.zeros(3)
         init_state[6:10] = eul2quat(torch.tensor(gt_rot[imu_to_gt_idx(t)]))
+        if noisy:
+            init_state[6:10] += torch.randn(4)*0.1
     #     init_state[6:10] = torch.tensor([1.0, 0.0, 0.0, 0.0])
         init_state[10:13] = torch.tensor([0, 0, 9.81])
 
-        init_cov = torch.diag(torch.tensor([3.0, 3.0, 3.0, 
+        init_cov = torch.diag(torch.tensor([5.0, 5.0, 0.01, 
                             0.2, 0.2, 0.01,
                             0.1, 0.1, 0.1, 0.1,
                             1.0, 1.0, 1.0,
@@ -1150,16 +1160,17 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             'last_update_gt': -1,  # Last GT idx data was added to the data structure
             'estimated_states': [], # Tracked estimates of states
             'estimated_covariance': [], # Tracked estimates of states
-            'estimated_states_vo': [], # Tracked estimates of states at VO rate
-            'estimated_covariance_vo': [], # Tracked estimates of states at VO rate
+            'state_means': [], # Tracked mean vectors of state probability
+            'state_covariance': [], # Tracked covariances of state probability
+            'imu_times': [], # Tracked imu times to match with the estimated states
         }
 
         recorded_data['dynamics_parameters'].append(dict(
-            pos_x_std=11.43, 
-            pos_y_std=11.13, 
+            pos_x_std=0.57, 
+            pos_y_std=0.79, 
             pos_z_std=1e-3, 
-            vel_x_std=17.02, 
-            vel_y_std=17.33, 
+            vel_x_std=0.04, 
+            vel_y_std=2.11, 
             vel_z_std=1e-4, 
             r_std=np.deg2rad(1.0), 
             p_std=np.deg2rad(1.0), 
@@ -1173,11 +1184,11 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             p_std=np.deg2rad(1.0), 
             y_std=np.deg2rad(1.0),
             imu_robust_threshold=0.7,
-            speed_std=3.02,
-            landmark_std=2.42,
+            speed_std=2.17,
+            landmark_std=11.54,
             speed_scale=0.20,
             speed_robust_threshold=5.0,
-            prange_std=5.04, 
+            prange_std=0.34, 
             prange_robust_threshold=3.0,
             carrier_std=10.0,
         ))
@@ -1428,58 +1439,96 @@ def gen_measurement_losses(test_filter, jitter=1e-4):
 # Uncertainty Modules
 ####################################################################################################################
 
-def compute_tau_bisection(epsilon, diff_xh_xi, weights, init_tau=30.0):
-    tau = init_tau
+# def compute_tau_bisection(epsilon, diff_xh_xi, weights, init_tau=30.0):
+#     tau = init_tau
     
-    for _ in range(20): 
-        is_inside = diff_xh_xi < tau
-        filter_integral = torch.sum(weights[is_inside])
-        if filter_integral < 1 - epsilon:
-            tau = 3/2 * tau
-        else:
-            tau = 1/2 * tau
+#     for _ in range(20): 
+#         is_inside = diff_xh_xi < tau
+#         filter_integral = torch.sum(weights[is_inside])
+#         if filter_integral < 1 - epsilon:
+#             tau = 3/2 * tau
+#         else:
+#             tau = 1/2 * tau
             
-    return tau
+#     return tau
 
-def compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights):
-    sigma = torch.sqrt(torch.sum(weights * torch.square(diff_xh_xi))) + 1e-6
-    return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
+# def compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights):
+#     sigma = torch.sqrt(torch.sum(weights * torch.square(diff_xh_xi))) + 1e-6
+#     return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
 
-def compute_tau_sigma(epsilon, var, weights):
-    sigma = torch.sqrt(torch.sum(weights * var)) + 1e-6
-    return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
+# def compute_tau_sigma(epsilon, var, weights):
+#     sigma = torch.sqrt(torch.sum(weights * var)) + 1e-6
+#     return torch.distributions.normal.Normal(loc=0.0, scale=sigma).icdf(torch.tensor(1-epsilon))
 
-def integrate_beliefs_1d(estimated_state, all_hypo_log_weights, all_hypo_states, all_hypo_cov, epsilon=0.01, dim=0):
-    if len(all_hypo_states.shape)==2:
-        all_hypo_states = all_hypo_states[None, :, :]
-        all_hypo_log_weights = all_hypo_log_weights[None, :]
-        all_hypo_cov = all_hypo_cov[None, :, :, :]
-    
-    num_hypo = all_hypo_log_weights.shape[0]
-    
-#     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim])
-    all_hypo_tau = torch.tensor([compute_tau_sigma(epsilon, all_hypo_cov[0, i, dim, dim], 1.0) for i in range(all_hypo_states.shape[1])])
-    diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + all_hypo_tau[None, :]
-    print(all_hypo_tau, torch.sqrt(all_hypo_cov[:, :, dim, dim]))
-#     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + torch.sqrt(all_hypo_cov[:, :, dim, dim])
-    
-    weights = torch.exp(all_hypo_log_weights)
-    
-#     diff_atau_xi = torch.abs(estimated_state[dim] + tau - all_hypo_states[:, :, dim])
-#     diff_btau_xi = torch.abs(estimated_state[dim] - tau - all_hypo_states[:, :, dim])
-    
-#     diff_ptau_xi = torch.maximum(diff_atau_xi, diff_btau_xi)
-#     diff_mtau_xi = torch.minimum(diff_atau_xi, diff_btau_xi)
-    
-    tau = compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights)
-#     tau = compute_tau_sigma(epsilon, all_hypo_cov[:, :, dim, dim], weights)
+def gmm_quantile_1d(means, covs, epsilon):
+    # Compute the quantile of a 1D Gaussian mixture model
+    # This is done by computing the quantile of each component and taking the maximum
+    # Input: means, covs, epsilon
+    # Output: tau
+    num_gaussians = means.shape[0]
+    tau = torch.zeros(num_gaussians)
+    for i in range(num_gaussians):
+        tau[i] = torch.distributions.normal.Normal(loc=means[i], scale=torch.sqrt(covs[i])).icdf(torch.tensor(1-epsilon))
+    return torch.max(tau)
 
-    #     sigma = 5.0 # all_hypo_cov[:, :, dim, dim]
-    #     integral_xh_xi = torch.erf(diff_xh_xi/sigma)
-    #     integral_ptau_xi = torch.erf(diff_ptau_xi/sigma)
-    #     integral_mtau_xi = torch.erf(diff_mtau_xi/sigma)
+#     if len(all_hypo_states.shape)==2:
+#         all_hypo_states = all_hypo_states[None, :, :]
+#         all_hypo_log_weights = all_hypo_log_weights[None, :]
+#         all_hypo_cov = all_hypo_cov[None, :, :, :]
+    
+#     num_hypo = all_hypo_log_weights.shape[0]
+    
+# #     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim])
+#     all_hypo_tau = torch.tensor([compute_tau_sigma(epsilon, all_hypo_cov[0, i, dim, dim], 1.0) for i in range(all_hypo_states.shape[1])])
+#     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + all_hypo_tau[None, :]
+#     print(all_hypo_tau, torch.sqrt(all_hypo_cov[:, :, dim, dim]))
+# #     diff_xh_xi = torch.abs(estimated_state[dim] - all_hypo_states[:, :, dim]) + torch.sqrt(all_hypo_cov[:, :, dim, dim])
+    
+#     weights = torch.exp(all_hypo_log_weights)
+    
+# #     diff_atau_xi = torch.abs(estimated_state[dim] + tau - all_hypo_states[:, :, dim])
+# #     diff_btau_xi = torch.abs(estimated_state[dim] - tau - all_hypo_states[:, :, dim])
+    
+# #     diff_ptau_xi = torch.maximum(diff_atau_xi, diff_btau_xi)
+# #     diff_mtau_xi = torch.minimum(diff_atau_xi, diff_btau_xi)
+    
+#     tau = compute_tau_empirical_sigma(epsilon, diff_xh_xi, weights)
+# #     tau = compute_tau_sigma(epsilon, all_hypo_cov[:, :, dim, dim], weights)
 
-    return tau
+#     #     sigma = 5.0 # all_hypo_cov[:, :, dim, dim]
+#     #     integral_xh_xi = torch.erf(diff_xh_xi/sigma)
+#     #     integral_ptau_xi = torch.erf(diff_ptau_xi/sigma)
+#     #     integral_mtau_xi = torch.erf(diff_mtau_xi/sigma)
+
+#     return tau
+
+def compute_error_bounds(estimated_state, states, covariances, epsilon=0.01): 
+    N, dims = states.shape
+    delta_pos_enu = states[:, :3] - estimated_state[None, :3]
+    
+    # quaternion from world to body frame
+    quat_mean = estimated_state[6:10]
+    pos_cov_enu = covariances[:, :3, :3]
+    quat_cov = torch.mean(covariances[:, 6:10, 6:10], dim=0, keepdim=False)
+
+    # Monte Carlo integration to incorporate projection uncertainty
+    M = 10
+    quat = torch.distributions.multivariate_normal.MultivariateNormal(quat_mean, quat_cov).sample((M,))
+    quat = quat / quat.norm(dim=1, keepdim=True)
+
+    # Project position difference along lateral, longitudinal, and vertical axes
+    rot_mat = tf.quaternion_to_matrix(quat)
+    pos_llv = rot_mat[None, :, :, :] @ delta_pos_enu[:, None, :, None]
+    cov_llv = rot_mat[None, :, :, :] @ pos_cov_enu[:, None, :, :] @ rot_mat[None, :, :, :].transpose(-2, -1)
+    pos_llv = torch.mean(pos_llv, dim=1).squeeze(-1)
+    cov_llv = torch.mean(cov_llv, dim=1)
+
+    # Compute error bounds
+    error_bounds = torch.zeros(3)
+    for i in range(3):
+        error_bounds[i] = gmm_quantile_1d(pos_llv[:, i], cov_llv[:, i, i], epsilon/2)
+    return error_bounds
+
 
 ####################################################################################################################
 # Parameter optimization ops
@@ -1581,21 +1630,28 @@ def plot_position_estimates(estimated_states, gt_pos, T_start, tmax, imu_to_gt_i
 
     gt_len = upper_gt-lower_gt
 
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 0], "r--", label="gt_x")
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 1], "b--", label="gt_y")
+    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 2], "g--", label="gt_z")
+
+    xlims = plt.xlim()
+    ylims = plt.ylim()
+
     states = estimated_states.detach()
     plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 0], "r", label="estimated_x")
     plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 1], "b", label="estimated_y")
     plt.plot(np.linspace(1, gt_len, num=num_elem), states[state_range, 2], "g", label="estimated_z")
 
-    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 0], "r--", label="gt_x")
-    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 1], "b--", label="gt_y")
-    plt.plot(np.linspace(1, gt_len, num=gt_len), gt_pos[lower_gt:upper_gt, 2], "g--", label="gt_z")
-
+    
     # plt.plot(gt_pos[lower_t_s-root_t_s:, 0], "r--", label="gt_x")
     # plt.plot(gt_pos[lower_t_s-root_t_s:, 1], "b--", label="gt_y")
     # plt.plot(gt_pos[lower_t_s-root_t_s:, 2], "g--", label="gt_z")
 
     plt.xlabel("time [s]")
     plt.ylabel("position [m]")
+
+    plt.xlim(xlims)
+    plt.ylim(ylims)
 
     plt.legend()
 
@@ -1659,45 +1715,61 @@ def visualize_ekf_covariance(test_filter, names=None):
 
 def plot_trajectory(states, state_range, gt_pos, gt_range):
     plt.figure()
-    plt.plot(states[state_range, 0], states[state_range, 1])
     plt.plot(gt_pos[gt_range, 0], gt_pos[gt_range, 1], "r--")
+    xlims = plt.xlim()
+    ylims = plt.ylim()
+    plt.plot(states[state_range, 0], states[state_range, 1])
+    plt.xlim(xlims)
+    plt.ylim(ylims)
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
     plt.legend(["estimated", "ground truth"])
 
 
-def visualize_error_bounds(xh, gt, nul, eul, t_s, root_t_s, lower_t_s, upper_t_s, lower_gt, upper_gt):
-    run_x_hat = torch.stack(xh)
-    run_gt = torch.stack(gt)
+def visualize_error_bounds(estimated_states, state_means, state_covariance, state_range, gt_pos, gt_rot, gt_range):
+    T = len(state_range)
+    
+    error_bounds = torch.zeros((T, 3))
+    print("Computing error bounds...")
+    for i, t in tqdm(enumerate(state_range)):
+        error_bounds[i, :] = compute_error_bounds(estimated_states[t, :], state_means[t, :, :], state_covariance[t, :, :, :], epsilon=0.01)
+        # print(error_bounds[i, :])
+    enu_error = estimated_states[state_range, :3] - gt_pos[gt_range, :3]
+    gt_rot_mat = tf.euler_angles_to_matrix(torch.tensor(gt_rot[gt_range]), ["X", "Y", "Z"])
+    gt_error = torch.abs((gt_rot_mat @ enu_error[:, :, None]).squeeze(-1))
 
-    overall_pe = torch.norm((run_x_hat[:, :2]-run_gt[:, :2]), dim=1)
-    overall_ul = torch.maximum(torch.stack(nul), torch.stack(eul))
+    # create 3 subplots for the 3 dimensions
+    plt.figure(figsize=(10, 10))
+    
+    # plot lateral error and bound
+    plt.subplot(311)
+    plt.title("Lateral Error")
+    plt.plot(gt_error[:, 0], "r--", label="gt error")
+    xlims = plt.xlim()
+    ylims = plt.ylim()
+    plt.plot(error_bounds[:, 0], "r", label="error bound")
+    plt.xlim(xlims)
+    plt.ylim(ylims)
+    plt.legend()
 
-    # mask = overall_ul>50.0
+    # plot longitudinal error and bound
+    plt.subplot(312)
+    plt.title("Longitudinal Error")
+    plt.plot(gt_error[:, 1], "b--", label="gt error")
+    xlims = plt.xlim()
+    ylims = plt.ylim()
+    plt.plot(error_bounds[:, 1], "b", label="error bound")
+    plt.xlim(xlims)
+    plt.ylim(ylims)
+    plt.legend()
 
-    # run_x_hat[mask] = np.nan
-    # run_gt[mask] = np.nan
-    # overall_pe[mask] = np.nan
-    # overall_ul[mask] = 50.0
-
-    # print(torch.sum((overall_ul<overall_pe)&(overall_pe>15.0))/len(overall_pe))
-
-    def visualize_1d_error_bound(dim, title):
-        plt.figure(figsize=(8, 8))
-        plt.xlabel("Position Error [m]")
-        plt.ylabel("Error bound [m]")
-        plt.scatter(overall_pe, overall_ul, color='k', s=3)
-        plt.plot([0, 50], [0, 50], 'r--')
-        plt.xlim([0, 50])
-        plt.ylim([0, 50])
-
-        plt.fill_between(range(len(run_gt)), run_x_hat[:, dim] - overall_ul, run_x_hat[:, dim] + overall_ul, color='g', alpha=0.5, label=title)
-        # plt.plot(run_x_hat[:, dim], 'r', label='State Estimate')
-        plt.plot(run_gt[:, dim], 'r--', label='Ground Truth')
-
-
-        plt.legend()
-
-    visualize_1d_error_bound(0, "North Error Bound")
-    visualize_1d_error_bound(1, "East Error Bound")
-    visualize_1d_error_bound(2, "Up Error Bound")
+    # plot vertical error and bound
+    plt.subplot(313)
+    plt.title("Vertical Error")
+    plt.plot(gt_error[:, 2], "g--", label="gt error")
+    xlims = plt.xlim()
+    ylims = plt.ylim()
+    plt.plot(error_bounds[:, 2], "g", label="error bound")
+    plt.xlim(xlims)
+    plt.ylim(ylims)
+    plt.legend()

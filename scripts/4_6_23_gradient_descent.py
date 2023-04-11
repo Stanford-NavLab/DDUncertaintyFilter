@@ -61,6 +61,8 @@ vo_data = prepare_vo_data("/scratch/users/shubhgup/1_18_winter/Left_features/2d3
 # 6. Load GPS Ambiguity and cycle slip data
 # ints_data = get_ints_data()
 # mixed_data = get_cycle_slip_data()
+# 7. Load SLAM pose data
+slam_data = load_slam_data("/scratch/users/shubhgup/1_18_winter/DDUncertaintyFilter/scripts/data/slam_data_gnss_imu_vo.pkl")
 
 # Generate index converters
 print("Generating index converters")
@@ -81,14 +83,34 @@ dynamics_model = PosVelQuatBiasModel()
 inter_const_bias = inter_const_bias_tensor(dd_data)
 
 kf_measurement_model = init_filter_measurement_model(dd_data, N_dim, IMU_VO_DD_MeasurementModel)
-# pf_measurement_model = init_filter_measurement_model(dd_data, N_dim, GNSSPFMeasurementModel_IMU_DD_VO)
+pf_measurement_model = init_filter_measurement_model(dd_data, N_dim, GNSSPFMeasurementModel_IMU_DD_VO)
 
-reset_filter = gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start)
+reset_filter = gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start, noisy=True)
 
-test_filter = AsyncExtendedKalmanFilter(
+test_filter_base = AsyncExtendedKalmanFilter(
     dynamics_model=dynamics_model, # Initialise the filter with the dynamic model
     measurement_model=kf_measurement_model, # Initialise the filter with the measurement model
     )
+
+test_filter = test_filter_base
+
+# # Create an instance of the rao-blackwellized particle filter
+# test_filter = AsyncRaoBlackwellizedParticleFilter(
+#     dynamics_model=dynamics_model,  # Dynamics model
+#     measurement_model=pf_measurement_model,  # Measurement model
+#     resample=False,  # Resample particles
+#     estimation_method="weighted_average",  # Use weighted average of particles
+#     num_particles= 5,  # Number of particles
+#     soft_resample_alpha=1.0,  # Soft resampling parameter
+# )
+
+# # mask for the position states
+# pf_idx_mask = torch.zeros(state_dim, dtype=torch.bool)
+# pf_idx_mask[:3] = True
+
+# # This function attaches a filter to the test_filter object. It takes in the dynamics_model, measurement model, and index mask. The mode is set to 'linearization_points' by default. The function then assigns the dynamics model, measurement model, and index mask to the filter. The bank mode is used to specify whether the filter is a bank filter, which is a filter that uses multiple filters to handle multiple targets.
+
+# test_filter.attach_ekf(test_filter_base, pf_idx_mask)
 
 # Reset filter
 t = T_start + IMU_rate_div
@@ -122,23 +144,23 @@ carrier_std_raw = torch.tensor(obs_parameters['carrier_std'], requires_grad=Fals
 
 param_dict_raw = { 'r_std': r_std_raw, 'p_std': p_std_raw, 'y_std': y_std_raw, 'gyr_bias_std': gyr_bias_std_raw, 'r_obs_std': r_obs_std_raw, 'p_obs_std': p_obs_std_raw, 'y_obs_std': y_obs_std_raw, 'vel_x_std': vel_x_std_raw, 'vel_y_std': vel_y_std_raw, 'speed_std': speed_std_raw, 'landmark_std': landmark_std_raw, 'speed_scale': speed_scale_raw, 'pos_x_std': pos_x_std_raw, 'pos_y_std': pos_y_std_raw, 'prange_std': prange_std_raw, 'carrier_std': carrier_std_raw}
 
-optimizer = optim.AdamW(param_dict_raw.values(), lr=5e-2)
+optimizer = optim.AdamW(param_dict_raw.values(), lr=1e-2)
 
 function_list = [None, None, None, None, 'softplus', 'softplus', 'softplus', 'softplus', 'softplus', 'softplus', 'softplus', None, 'softplus', 'softplus', 'softplus', 'softplus']
 param_dict = get_param_dict(param_dict_raw, function_list)
 
 opt_state_dict_list = []
 
-imu_measurement_loss, vo_measurement_loss, vo_tight_measurement_loss, gnss_measurement_loss, supervised_position_loss = gen_measurement_losses(test_filter, jitter=1e-4)
+imu_measurement_loss, vo_measurement_loss, vo_tight_measurement_loss, gnss_measurement_loss, supervised_position_loss = gen_measurement_losses(test_filter_base, jitter=1e-4)
 
 print_params(param_dict)
 
 try:
     print("Starting optimization")
     # k-step transition predict step gradient descent
-    K_window = 10
+    K_window = 5
     shuffled_times = list(range(T_start + IMU_rate_div, T - IMU_rate_div, IMU_rate_div))
-    for epoch in tqdm(range(1000)):
+    for epoch in tqdm(range(5000)):
         print("Epoch: ", epoch)
         np.random.shuffle(shuffled_times)
         for t_0 in tqdm(range(100), leave=False):
@@ -189,23 +211,52 @@ try:
                     vo_idx = new_vo_idx
 
                     # Load VO data
-                    landmark_3d, pixel_2d, K, ransac_R, ransac_t = load_vo_data(vo_idx, vo_data, size=50)
+                    landmark_3d, pixel_2d, K, ransac_R, ransac_t = load_vo_data(vo_idx, vo_data, size=10)
                     
-                    estimated_state = vo_update(test_filter, estimated_state, landmark_3d, pixel_2d, K, ransac_R, ransac_t, param_dict['speed_std'], param_dict['speed_scale'], torch.tensor(obs_parameters['speed_robust_threshold']), vel_scaling_factor=IMU_rate_div/27/dt, m_estimation=False)
+                    prev_imu_idx = slam_data['time_to_index'](t - IMU_rate_div)
+                    if prev_imu_idx < len(slam_data['estimated_states']):
+                        # print("prev_imu_idx", prev_imu_idx)
+                        # print("slam_data['imu_times']", slam_data['imu_times'][prev_imu_idx])
+                        # print("len(recorded_data['estimated_states'])", len(recorded_data['estimated_states']))
+                        # prev_state = recorded_data['estimated_states'][prev_imu_idx]
+                        # # prev_state = recorded_data['estimated_states_vo'][len(recorded_data['estimated_states_vo'])-1]
+                        # prev_covariance = recorded_data['estimated_covariance'][prev_imu_idx]
                     
-                    if estimated_state_vo is not None:
+                        # # Provide GT locations of previous features
+                        # prev_gt_idx = imu_to_gt_idx(vo_to_imu_idx(vo_idx))-1
+                        # tmp_vel = (gt_pos[prev_gt_idx + 1, :] - gt_pos[prev_gt_idx, :])/400
+                        # prev_pos = gt_pos[prev_gt_idx, :] + tmp_vel*(vo_to_imu_idx(vo_idx) - gt_to_imu_idx(prev_gt_idx))
+                        # prev_state[:, :3] = torch.tensor(prev_pos)
+
+                        # Provide filter interpolated locations of previous features
+                        prev_state = slam_data['estimated_states'][prev_imu_idx]
+                        prev_covariance = slam_data['estimated_covariance'][prev_imu_idx]
+                        prev_t = slam_data['imu_times'][prev_imu_idx]
+                        tmp_vel = prev_state[0, 3:6]/400
+                        prev_pos = prev_state[0, :3] + tmp_vel*(vo_to_imu_idx(vo_idx) - prev_t)
+                        prev_state[:, :3] = torch.tensor(prev_pos)
+
+
                         estimated_state = vo_tight_update(
                             test_filter, estimated_state,
-                            estimated_state_vo,
+                            prev_state, prev_covariance,
                             landmark_3d, pixel_2d, K, 
                             param_dict['landmark_std'], param_dict['speed_scale'],
                             torch.tensor(obs_parameters['speed_robust_threshold']),
                             vel_scaling_factor=IMU_rate_div/27/dt,
                             m_estimation=False
                             )
-                        loss += vo_tight_measurement_loss(pixel_2d, estimated_state)*0.1
+                        loss += vo_tight_measurement_loss(pixel_2d, estimated_state)
                     estimated_state_vo = estimated_state.detach().clone()
 
+                    estimated_state = vo_update(
+                        test_filter, estimated_state,
+                        landmark_3d, pixel_2d, K, ransac_R, ransac_t, 
+                        param_dict['speed_std'], param_dict['speed_scale'],
+                        torch.tensor(obs_parameters['speed_robust_threshold']),
+                        vel_scaling_factor=IMU_rate_div/27/dt,
+                        m_estimation=False
+                        )
                     # loss += vo_measurement_loss(ransac_t, estimated_state)*0.1
                 
                 new_dd_idx = imu_to_gnss_idx(t)
@@ -220,7 +271,7 @@ try:
 
                     estimated_state = gnss_update(test_filter, estimated_state, gnss_observation, satpos, ref, inter_const_bias, idx_code_mask, idx_carr_mask, param_dict['prange_std'], param_dict['carrier_std'], torch.tensor(obs_parameters['prange_robust_threshold']), m_estimation=False)
                     
-                    loss += gnss_measurement_loss(gnss_observation, estimated_state)*0.2
+                    loss += gnss_measurement_loss(gnss_observation, estimated_state)
             
             # Supervised update
             new_gt_idx = imu_to_gt_idx(t)
@@ -247,7 +298,7 @@ except KeyboardInterrupt:
     print("Saving loss plot to image")
     plt.figure()
     plot_loss(opt_state_dict_list, window_size=500)
-    plt.savefig('data/loss_plot.png')
+    plt.savefig('data/loss_plot.svg')
 
     param_names = ['r_std', 'p_std', 'y_std', 'gyr_bias_std', 'r_obs_std', 'p_obs_std', 'y_obs_std', 'vel_x_std', 'vel_y_std', 'speed_std', 'landmark_std', 'speed_scale', 'pos_x_std', 'pos_y_std', 'prange_std', 'carrier_std']
 
@@ -255,4 +306,22 @@ except KeyboardInterrupt:
     print("Saving parameter trajectory to image")
     plt.figure()
     plot_parameters(opt_state_dict_list, names=param_names, window_size=500)
-    plt.savefig('data/parameter_plot.png')
+    plt.savefig('data/parameter_plot.svg')
+
+# Save the results
+print("Saving the results... ", 'data/opt_state_dict_list.npy')
+np.save('data/opt_state_dict_list.npy', opt_state_dict_list)
+
+# Save loss plot to image
+print("Saving loss plot to image")
+plt.figure()
+plot_loss(opt_state_dict_list, window_size=500)
+plt.savefig('data/loss_plot.svg')
+
+param_names = ['r_std', 'p_std', 'y_std', 'gyr_bias_std', 'r_obs_std', 'p_obs_std', 'y_obs_std', 'vel_x_std', 'vel_y_std', 'speed_std', 'landmark_std', 'speed_scale', 'pos_x_std', 'pos_y_std', 'prange_std', 'carrier_std']
+
+# Save parameter trajectory to image
+print("Saving parameter trajectory to image")
+plt.figure()
+plot_parameters(opt_state_dict_list, names=param_names, window_size=500)
+plt.savefig('data/parameter_plot.svg')

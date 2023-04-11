@@ -62,7 +62,7 @@ vo_data = prepare_vo_data("/scratch/users/shubhgup/1_18_winter/Left_features/2d3
 # ints_data = get_ints_data()
 # mixed_data = get_cycle_slip_data()
 # 7. Load SLAM pose data
-slam_data = load_slam_data("/scratch/users/shubhgup/1_18_winter/DDUncertaintyFilter/scripts/data/slam_recorded_data.pkl")
+slam_data = load_slam_data("/scratch/users/shubhgup/1_18_winter/DDUncertaintyFilter/scripts/data/slam_data_gnss_imu_vo.pkl")
 
 # Generate index converters
 print("Generating index converters")
@@ -87,19 +87,20 @@ pf_measurement_model = init_filter_measurement_model(dd_data, N_dim, GNSSPFMeasu
 
 reset_filter = gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start)
 
-test_filter = AsyncExtendedKalmanFilter(
+test_filter_base = AsyncExtendedKalmanFilter(
     dynamics_model=dynamics_model, # Initialise the filter with the dynamic model
     measurement_model=kf_measurement_model, # Initialise the filter with the measurement model
     )
 
+test_filter = test_filter_base
 # # Create an instance of the rao-blackwellized particle filter
 # test_filter = AsyncRaoBlackwellizedParticleFilter(
 #     dynamics_model=dynamics_model,  # Dynamics model
 #     measurement_model=pf_measurement_model,  # Measurement model
-#     resample=False,  # Resample particles
+#     resample=True,  # Resample particles
 #     estimation_method="weighted_average",  # Use weighted average of particles
-#     num_particles= 1,  # Number of particles
-#     # soft_resample_alpha=1.0,  # Soft resampling parameter
+#     num_particles= 20,  # Number of particles
+#     soft_resample_alpha=1.0,  # Soft resampling parameter
 # )
 
 # # mask for the position states
@@ -154,27 +155,32 @@ def run_timestep(t, recorded_data):
         vo_idx = new_vo_idx
 
         # Load VO data
-        landmark_3d, pixel_2d, K, ransac_R, ransac_t = load_vo_data(vo_idx, vo_data, size=50)
-        
-#         print("ransac_t: ", ransac_t)
-        # estimated_state = vo_update(
-        #     test_filter, estimated_state,
-        #     landmark_3d, pixel_2d, K, ransac_R, ransac_t, 
-        #     torch.tensor(obs_parameters['speed_std']), torch.tensor(obs_parameters['speed_scale']),
-        #     torch.tensor(obs_parameters['speed_robust_threshold']),
-        #     vel_scaling_factor=IMU_rate_div/27/dt,
-        #     m_estimation=False
-        #     )
-        
-        if len(recorded_data['estimated_states_vo']) > 0:
-            prev_state = slam_data['estimated_states_vo'][len(recorded_data['estimated_states_vo'])]
-            prev_covariance = slam_data['estimated_covariance_vo'][len(recorded_data['estimated_states_vo'])]
+        landmark_3d, pixel_2d, K, ransac_R, ransac_t = load_vo_data(vo_idx, vo_data, size=20)
+        # if(np.linalg.norm(ransac_R) > 1e-1):
+        #     print("---------------------------------------------------------------ransac_R: ", tf.matrix_to_euler_angles(torch.tensor(cv2.Rodrigues(ransac_R)[0]), ["X", "Y", "Z"]))
+
+        prev_imu_idx = slam_data['time_to_index'](t - IMU_rate_div)
+        if len(recorded_data['estimated_states']) > 0:
+            # print("prev_imu_idx", prev_imu_idx)
+            # print("slam_data['imu_times']", slam_data['imu_times'][prev_imu_idx])
+            # print("len(recorded_data['estimated_states'])", len(recorded_data['estimated_states']))
+            # prev_state = recorded_data['estimated_states'][prev_imu_idx]
+            # # prev_state = recorded_data['estimated_states_vo'][len(recorded_data['estimated_states_vo'])-1]
+            # prev_covariance = recorded_data['estimated_covariance'][prev_imu_idx]
         
             # # Provide GT locations of previous features
             # prev_gt_idx = imu_to_gt_idx(vo_to_imu_idx(vo_idx))-1
             # tmp_vel = (gt_pos[prev_gt_idx + 1, :] - gt_pos[prev_gt_idx, :])/400
             # prev_pos = gt_pos[prev_gt_idx, :] + tmp_vel*(vo_to_imu_idx(vo_idx) - gt_to_imu_idx(prev_gt_idx))
             # prev_state[:, :3] = torch.tensor(prev_pos)
+
+            # Provide filter interpolated locations of previous features
+            prev_state = slam_data['estimated_states'][prev_imu_idx]
+            prev_covariance = slam_data['estimated_covariance'][prev_imu_idx]
+            prev_t = slam_data['imu_times'][prev_imu_idx]
+            tmp_vel = prev_state[0, 3:6]/400
+            prev_pos = prev_state[0, :3] + tmp_vel*(vo_to_imu_idx(vo_idx) - prev_t)
+            prev_state[:, :3] = prev_pos
 
             # print("prev_state: ", prev_state)
             # print("estimated_state (1): ", estimated_state)
@@ -188,7 +194,16 @@ def run_timestep(t, recorded_data):
                 m_estimation=False
                 )
             # print("estimated_state (2): ", estimated_state)
-    
+        #         print("ransac_t: ", ransac_t)
+        estimated_state = vo_update(
+            test_filter, estimated_state,
+            landmark_3d, pixel_2d, K, ransac_R, ransac_t, 
+            torch.tensor(obs_parameters['speed_std']), torch.tensor(obs_parameters['speed_scale']),
+            torch.tensor(obs_parameters['speed_robust_threshold']),
+            vel_scaling_factor=IMU_rate_div/27/dt,
+            m_estimation=False
+            )
+
     # GNSS data
     dd_idx = recorded_data['last_update_gnss']
     new_dd_idx = imu_to_gnss_idx(t)
@@ -215,10 +230,12 @@ def run_timestep(t, recorded_data):
     recorded_data['last_update_imu'] = t
     if not recorded_data['last_update_vo'] == vo_idx:
         recorded_data['last_update_vo'] = vo_idx
-        recorded_data['estimated_states_vo'].append(estimated_state)
-        recorded_data['estimated_covariance_vo'].append(estimated_covariance)
-    recorded_data['estimated_states'].append(estimated_state)
-    recorded_data['estimated_covariance'].append(estimated_covariance)
+    recorded_data['estimated_states'].append(estimated_state.detach().clone())
+    recorded_data['estimated_covariance'].append(estimated_covariance.detach().clone())
+    state_means, state_covariance = test_filter.get_state_statistics()
+    recorded_data['state_means'].append(state_means.detach().clone())
+    recorded_data['state_covariance'].append(state_covariance.detach().clone())
+    recorded_data['imu_times'].append(t)
     
     return recorded_data
 
@@ -236,8 +253,13 @@ with open('data/recorded_data.pkl', 'wb') as f:
     pickle.dump(recorded_data, f)
 
 estimated_states = torch.zeros(T, state_dim)
-for i, t in tqdm(enumerate(range(T_start+IMU_rate_div, T, IMU_rate_div))):
+num_hypotheses = recorded_data['state_means'][0].shape[0]
+state_means = torch.zeros(T, num_hypotheses, state_dim)
+state_covariance = torch.eye(state_dim).reshape(1, 1, state_dim, state_dim).expand(T, num_hypotheses, state_dim, state_dim)
+for i, t in enumerate(range(T_start+IMU_rate_div, T, IMU_rate_div)):
     estimated_states[t, :] = recorded_data['estimated_states'][i][0, :]
+    state_means[t, :, :] = recorded_data['state_means'][i]
+    state_covariance[t, :, :, :] = recorded_data['state_covariance'][i]
 
 tmax = T
 
@@ -248,25 +270,31 @@ gt_range = [imu_to_gt_idx(t) for t in state_range]
 print("Saving state trajectory to image")
 plt.figure()
 plot_position_estimates(estimated_states, gt_pos, T_start, tmax, imu_to_gt_idx, IMU_rate_div)
-plt.savefig('data/position_plot.png')
+plt.savefig('data/position_plot.svg')
 plt.figure()
 plot_trajectory(estimated_states, state_range, gt_pos, gt_range)
-plt.savefig('data/trajectory_plot.png')
+plt.savefig('data/trajectory_plot.svg')
 
 # Save tracking error to image
 print("Saving tracking error to image")
 plt.figure()
 plot_tracking_error(estimated_states, gt_pos, state_range, imu_to_gt_idx)
-plt.savefig('data/tracking_error_plot.png')
+plt.savefig('data/tracking_error_plot.svg')
+
+# Save position error bounds to image
+print("Saving position error bounds to image")
+plt.figure()
+visualize_error_bounds(estimated_states, state_means, state_covariance, state_range, gt_pos, gt_rot, gt_range)
+plt.savefig('data/error_bounds_plot.svg')
 
 # Save rotation error to image
 print("Saving rotation error to image")
 plt.figure()
 plot_orientation_estimates(estimated_states, state_range, gt_rot, gt_range)
-plt.savefig('data/orientation_plot.png')
+plt.savefig('data/orientation_plot.svg')
 
 # Save velocity error to image
 print("Saving velocity error to image")
 plt.figure()
 plot_velocity_estimates(estimated_states, state_range, gt_pos, gt_range)
-plt.savefig('data/velocity_plot.png')
+plt.savefig('data/velocity_plot.svg')

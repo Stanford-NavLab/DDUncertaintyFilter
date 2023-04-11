@@ -12,5 +12,5 @@ class MEstimationModel(object):
     
     def generate_outlier_mask(self, residuals):
         if self.debug:
-            print("residuals", residuals)
+            print("residuals", residuals.detach().numpy().flatten())
         return torch.abs(residuals) > self.threshold

@@ -68,6 +68,9 @@ class AsyncExtendedKalmanFilter(tfilter.filters.ExtendedKalmanFilter):
     def get_covariance(self):
         return self.belief_covariance
     
+    def get_state_statistics(self):
+        return self.belief_mean, self.belief_covariance
+    
 class AsyncExtendedInformationFilter(tfilter.filters.ExtendedInformationFilter):
     """Differentiable EIF with asynchronous observation and controls forward pass.
 
@@ -340,8 +343,8 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
             be `(N, state_dim).`
         """
 
-        # Make sure our particle filter's been initialized
-        assert self._initialized, "Particle filter not initialized!"
+        # Make sure our filter's been initialized
+        assert self._initialized, "Filter not initialized!"
 
         # Get our batch size (N), current particle count (M), & state dimension
         N, M, state_dim = self.particle_states.shape
@@ -424,13 +427,13 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
             if self.mode=='bank':
                 self.particle_states = predicted_states[:, :self.pf_state_dim]
             elif self.mode=='linearization_points':
-                # self.particle_states = (
-                #     torch.distributions.MultivariateNormal(
-                #         loc=predicted_states[:, :self.pf_state_dim], scale_tril=process_Q_pf
-                #     )
-                #     .rsample()  # Note that we use `rsample` to make sampling differentiable
-                # )
-                self.particle_states = predicted_states[:, :self.pf_state_dim]
+                self.particle_states = (
+                    torch.distributions.MultivariateNormal(
+                        loc=predicted_states[:, :self.pf_state_dim], scale_tril=process_Q_pf
+                    )
+                    .rsample()  # Note that we use `rsample` to make sampling differentiable
+                )
+                # self.particle_states = predicted_states[:, :self.pf_state_dim]
             
             # Run EKF predict step
             predicted_states = self.ekf(controls=reshaped_controls, observations=None)
@@ -603,3 +606,20 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         # compute weighted covariance
         covariance = torch.sum(weights * self.kf_covariance, dim=1, keepdim=False)
         return covariance
+    
+    def get_empirical_covariance(self):
+        # convert self.particle_log_weights to weights
+        weights = torch.exp(self.particle_log_weights)
+        weights = weights.unsqueeze(-1)
+        estimated_state = torch.sum(
+                weights
+                * self.particle_states,
+                dim=1,
+            )
+        state_diff = self.particle_states - estimated_state.unsqueeze(1)
+        # compute weighted empirical covariance
+        covariance = torch.sum(weights * state_diff * state_diff.transpose(1, 2), dim=1, keepdim=False)
+        return covariance
+    
+    def get_state_statistics(self):
+        return self.particle_states[0, :, :], self.kf_covariance[0, :, :, :]

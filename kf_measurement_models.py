@@ -59,7 +59,7 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         if self.include_correntropy:
             self.prange_std_tail = prange_std_tail
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=20.0)
+        self.robust_cost_model = MEstimationModel(threshold=200.0)
             
 
     def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None, linearization_point=None):
@@ -240,7 +240,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.landmark_std = torch.tensor(10.0)   # N_landmarks*2
         self.scale = torch.tensor(1.0)
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=10.0, debug=True)
+        self.robust_cost_model = MEstimationModel(threshold=100.0, debug=False)
 
     def update(self, landmark_std=None, landmarks=None, intrinsic=None, scale=None, prev_state=None, prev_covariance=None, linearization_point=None):
         if landmark_std is not None:
@@ -259,7 +259,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             self.linearization_point = linearization_point
         self.observation_dim = 2*self.landmarks.shape[0]
 
-    def cholesky(self, vel_enu, orientation, rmat):
+    def cholesky(self, vel_enu, orientation, delta_quat):
         # Return the covariance matrix of the noise.
         N, _ = vel_enu.shape
         orientation = orientation[:, None, :].expand((N, self.observation_dim, 4)).reshape(-1, 4)
@@ -276,6 +276,13 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             ret_chol = torch.diag_embed(ret_chol)
         return ret_chol    
     
+    def transform_landmark_std(self):
+        pos_cov = (self.scale**2)*self.prev_covariance[0, :3, :3][[0, 2, 1], :][:, [0, 2, 1]]
+        projection_cov = torch.matmul(torch.matmul(self.K, pos_cov), self.K.T)
+        x_std = torch.sqrt(projection_cov[0, 0])*1e-2
+        y_std = torch.sqrt(projection_cov[1, 1])*1e-2
+        return x_std, y_std
+
     def robust_cost_cholesky(self, observation, expected_observation, vel_enu, orientation, rmat):
         with torch.no_grad():
             residual = observation - expected_observation
@@ -283,17 +290,22 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
             outlier_mask = self.robust_cost_model.generate_outlier_mask(residual)
             
         N, _ = residual.shape
-        R = torch.ones(N, self.observation_dim)*self.landmark_std
+        x_std, y_std = self.transform_landmark_std()
+        R = torch.ones(N, self.observation_dim)
+        R[:, :self.observation_dim//2] = x_std + self.landmark_std
+        R[:, self.observation_dim//2:] = y_std + self.landmark_std
         R[outlier_mask] = 1e6
-        R = torch.diag_embed(R) # + self.cholesky(vel_enu, orientation, rmat)
+        # R = torch.diag_embed(R) + self.scale*self.cholesky(vel_enu, orientation, rmat)
+        R = torch.diag_embed(R)
         return R
     
-    def _vel_to_2dfeatures(self, vel_enu, orientation, rmat):
+    def _vel_to_2dfeatures(self, vel_enu, orientation, delta_quat):
         N = vel_enu.shape[0]
-        # Transform the ENU velocity to body frame in camera reference
-        cam_velocity = self._enu_to_camera_velocity(vel_enu, orientation, N)
         
-        extr = self._construct_extrinsics(rmat, cam_velocity, N)
+        # Transform the ENU velocity to body frame in camera reference
+        cam_velocity, cam_delta_quat = self._enu_to_camera_velocity(vel_enu, orientation, delta_quat, N)
+        
+        extr = self._construct_extrinsics(cam_delta_quat, cam_velocity, N)
         
         # Calculate intrinsic matrix
         intr = self._construct_intrinsics(self.K)
@@ -306,8 +318,8 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         img_pts = self._project_3d_points_to_image_plane(proj, obj_pts, N)
 
         return img_pts
-
-    def _enu_to_camera_velocity(self, vel_enu, orientation, N):
+    
+    def _enu_to_camera_velocity(self, vel_enu, orientation, delta_quat, N):
         # Rotate the velocity from ENU to body frame.
         body_velocity = tf.quaternion_apply(orientation, vel_enu)
         # Rearrange the axes from (x, y, z) to (x, z, y).
@@ -323,9 +335,12 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         # # the body frame, so the x and y axes are no longer aligned with
         # # the body frame.
         # cam_velocity[:, :2, :] = 0.0
-        return cam_velocity
+        # print("delta_quat (2): ", delta_eul[0])
+        return cam_velocity, delta_quat
 
-    def _construct_extrinsics(self, rmat, body_velocity, N):
+    def _construct_extrinsics(self, delta_quat, body_velocity, N):
+        # relative rotation matrix
+        rmat = tf.quaternion_to_matrix(delta_quat).float().expand(N, 3, 3)
         # Concatenate rotation matrix with body velocity
         extr = torch.cat([rmat, body_velocity], dim=-1)
         # Add 0, 0, 0, 1 to bottom row of extrinsics matrix
@@ -385,15 +400,14 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         # Compute the change in rotation between frames (TODO: unit test this)
         # delta_quat = quat_delta(prev_quat, quat)  # N*3
         delta_quat = quat_delta(quat, quat)
-        # relative rotation matrix
-        rmat = tf.quaternion_to_matrix(delta_quat).float().expand(N, 3, 3)
+        
         # Compute the ENU motion from state variables
         vel_enu = (states[:, :3]-self.prev_state[:, :3])*self.scale
         # Calculate expected 2d landmark locations
-        img_pts = self._vel_to_2dfeatures(vel_enu, orientation, rmat)
+        img_pts = self._vel_to_2dfeatures(vel_enu, orientation, delta_quat)
         
         # Calculate covariance of expected 2d landmark locations
-        R = self.robust_cost_cholesky(self.linearization_point, img_pts, vel_enu, orientation, rmat)   # N*(N_landmarks*2)*(N_landmarks*2)
+        R = self.robust_cost_cholesky(self.linearization_point, img_pts, vel_enu, orientation, delta_quat)   # N*(N_landmarks*2)*(N_landmarks*2)
 
         return img_pts.float(), R.float()
     
