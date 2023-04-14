@@ -59,7 +59,7 @@ class GNSSDDKFMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         if self.include_correntropy:
             self.prange_std_tail = prange_std_tail
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=200.0)
+        self.robust_cost_model = MEstimationModel(threshold=20.0)
             
 
     def update(self, satXYZb=None, ref_idx=None, inter_const_bias=None, idx_code_mask=None, idx_carr_mask=None, prange_std=None, carrier_std=None, estimated_N=None, linearization_point=None):
@@ -240,7 +240,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         self.landmark_std = torch.tensor(10.0)   # N_landmarks*2
         self.scale = torch.tensor(1.0)
         self.linearization_point = None
-        self.robust_cost_model = MEstimationModel(threshold=100.0, debug=False)
+        self.robust_cost_model = MEstimationModel(threshold=0.2, debug=False)
 
     def update(self, landmark_std=None, landmarks=None, intrinsic=None, scale=None, prev_state=None, prev_covariance=None, linearization_point=None):
         if landmark_std is not None:
@@ -277,7 +277,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         return ret_chol    
     
     def transform_landmark_std(self):
-        pos_cov = (self.scale**2)*self.prev_covariance[0, :3, :3][[0, 2, 1], :][:, [0, 2, 1]]
+        pos_cov = self.prev_covariance[0, :3, :3][[0, 2, 1], :][:, [0, 2, 1]]
         projection_cov = torch.matmul(torch.matmul(self.K, pos_cov), self.K.T)
         x_std = torch.sqrt(projection_cov[0, 0])*1e-2
         y_std = torch.sqrt(projection_cov[1, 1])*1e-2
@@ -294,7 +294,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         R = torch.ones(N, self.observation_dim)
         R[:, :self.observation_dim//2] = x_std + self.landmark_std
         R[:, self.observation_dim//2:] = y_std + self.landmark_std
-        R[outlier_mask] = 1e6
+        R[outlier_mask] = 1e4
         # R = torch.diag_embed(R) + self.scale*self.cholesky(vel_enu, orientation, rmat)
         R = torch.diag_embed(R)
         return R
@@ -402,7 +402,7 @@ class VOLandmarkMeasurementModel(tfilter.base.KalmanFilterMeasurementModel):
         delta_quat = quat_delta(quat, quat)
         
         # Compute the ENU motion from state variables
-        vel_enu = (states[:, :3]-self.prev_state[:, :3])*self.scale
+        vel_enu = (states[:, :3]-self.prev_state[:, :3])
         # Calculate expected 2d landmark locations
         img_pts = self._vel_to_2dfeatures(vel_enu, orientation, delta_quat)
         

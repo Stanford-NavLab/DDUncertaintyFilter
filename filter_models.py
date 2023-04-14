@@ -70,6 +70,83 @@ class AsyncExtendedKalmanFilter(tfilter.filters.ExtendedKalmanFilter):
     
     def get_state_statistics(self):
         return self.belief_mean, self.belief_covariance
+
+class AsyncUnscentedKalmanFilter(tfilter.filters.UnscentedKalmanFilter):
+    """Differentiable UKF with asynchronous observation and controls forward pass.
+
+    TODO: For building estimators with more complex observation spaces (eg images), see
+    `VirtualSensorExtendedKalmanFilter`.
+    """
+    @overrides
+    def forward(
+        self,
+        *,
+        observations: types.ObservationsTorch,
+        controls: types.ControlsTorch,
+    ) -> types.StatesTorch:
+        """Kalman filter forward pass, single timestep.
+
+        Args:
+            observations (dict or torch.Tensor): Observation inputs. Should be either a
+                dict of tensors or tensor of shape `(N, ...)`.
+            controls (dict or torch.Tensor): Control inputs. Should be either a dict of
+                tensors or tensor of shape `(N, ...)`.
+
+        Returns:
+            torch.Tensor: Predicted state for each batch element. Shape should
+            be `(N, state_dim).`
+        """
+        # Check initialization
+        assert self._initialized, "Kalman filter not initialized!"
+
+        # Validate inputs
+        N, state_dim = self.belief_mean.shape
+        
+        if controls is not None:
+            assert fp.utils.SliceWrapper(controls).shape[0] == N
+            # Fix positive definiteness of covariance
+            min_eig = torch.min(torch.linalg.eigvalsh(self._belief_covariance))
+            if min_eig < 0:
+                self._belief_covariance -= (1 + 1e-1) * min_eig * torch.eye(state_dim)
+            
+            # Predict step
+            self._predict_step(controls=controls)
+
+        if observations is not None:
+            assert fp.utils.SliceWrapper(observations).shape[0] == N
+            # Fix positive definiteness of covariance
+            eigs = torch.linalg.eigvalsh(self._belief_covariance)
+            min_eig = torch.min(eigs)
+            # print(eigs)
+            if min_eig < 0:
+                self._belief_covariance -= (1 + 1e-1) * min_eig * torch.eye(state_dim)
+
+            # Update step
+            self._update_step(observations=observations)
+
+        # Return mean
+        return self.belief_mean
+    
+    def update_gnss(self, *args, **kwargs):
+        self.measurement_model.update_gnss(*args, **kwargs)
+        
+    def update_imu(self, *args, **kwargs):
+        self.measurement_model.update_imu(*args, **kwargs)
+        
+    def update_vo(self, *args, **kwargs):
+        self.measurement_model.update_vo(*args, **kwargs)
+        
+    def update_vo_base(self, *args, **kwargs):
+        self.measurement_model.update_vo_base(*args, **kwargs)
+        
+    def update_dynamics(self, *args, **kwargs):
+        self.dynamics_model.update(*args, **kwargs)
+
+    def get_covariance(self):
+        return self.belief_covariance
+    
+    def get_state_statistics(self):
+        return self.belief_mean, self.belief_covariance
     
 class AsyncExtendedInformationFilter(tfilter.filters.ExtendedInformationFilter):
     """Differentiable EIF with asynchronous observation and controls forward pass.
@@ -291,6 +368,7 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         self.pf_state_uncertainty = 1 + 0e-1
         self.resample_factor = 0.5
         self.jitter_dynamics = 1 + 0e-1
+        self.jitter_observation = 1e-1
         
         # Sample particles (assumes pf_state_mask has initial states and kf has later ones)
         pf_covariance = covariance[:, :self.pf_state_dim, :self.pf_state_dim]
@@ -422,11 +500,11 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
             predicted_states, process_Q = self.dynamics_model(reshaped_states, reshaped_controls)
 
             process_Q_pf = self.jitter_dynamics*process_Q[:, :self.pf_state_dim, :self.pf_state_dim]
-            
+
             # Propagate PF state parts
             if self.mode=='bank':
                 self.particle_states = predicted_states[:, :self.pf_state_dim]
-            elif self.mode=='linearization_points':
+            elif self.mode in ['linearization_points', 'naive']:
                 self.particle_states = (
                     torch.distributions.MultivariateNormal(
                         loc=predicted_states[:, :self.pf_state_dim], scale_tril=process_Q_pf
@@ -440,6 +518,7 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
 
             # Concatenate with EKF state parts
             self.particle_states = torch.cat((self.particle_states, predicted_states[:, self.pf_state_dim:]), -1).view(N, M, self.state_dim)
+            # self.particle_states[:, -1, :] = predicted_states.view(N, M, self.state_dim)[:, -1, :]  # Last particle is the EKF prediction (no noise)
             self.kf_covariance = self.ekf.get_covariance().reshape(N, M, state_dim, state_dim)
             
             assert self.particle_states.shape == (N, M, self.state_dim)
@@ -450,19 +529,46 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         if observations is not None:
             reshaped_states = self.particle_states.reshape(-1, self.state_dim)
             reshaped_covariance = self.kf_covariance.reshape(-1, self.state_dim, self.state_dim)
+            reshaped_covariance[:, :3, :3] += self.jitter_observation*torch.eye(3).to(reshaped_covariance.device)
             reshaped_observations = fp.utils.SliceWrapper(observations).map(
                 lambda tensor: torch.repeat_interleave(tensor, repeats=M, dim=0)
             )
             self.ekf._belief_mean = reshaped_states
             self.ekf._belief_covariance = reshaped_covariance
             
-            # print(self.ekf.measurement_model.observation_dim)
-            corrected_states = self.ekf(controls=None, observations=reshaped_observations)
-      
+            try:
+                corrected_states = self.ekf(controls=None, observations=reshaped_observations)
+            except:
+                # Debugging innovation_covariance
+                # Measurement model forward pass, Jacobian
+                observations_mean = reshaped_observations
+                pred_mean = reshaped_states
+                pred_covariance = reshaped_covariance
+                pred_observations, observations_tril = self.ekf.measurement_model(states=pred_mean)
+                observations_covariance = observations_tril @ observations_tril.transpose(
+                    -1, -2
+                )
+                C_matrix = self.ekf.measurement_model.jacobian(states=pred_mean)
+                
+                # Compute Kalman Gain, innovation
+                innovation = observations_mean - pred_observations
+                innovation_covariance = (
+                    C_matrix @ pred_covariance @ C_matrix.transpose(-1, -2)
+                    + observations_covariance
+                )
+                for cov in innovation_covariance:
+                    print(cov)
+                    tmp = torch.inverse(innovation_covariance)
+                raise
+
             # Retain particle states or use full EKF states
-#             self.particle_states = torch.cat((reshaped_states[:, self.pf_state_mask], corrected_states[:, ~self.pf_state_mask]), -1).reshape(N, M, self.state_dim)
-            self.particle_states = corrected_states.reshape(N, M, self.state_dim)
-            self.kf_covariance = self.ekf.get_covariance().reshape(N, M, state_dim, state_dim)
+            if self.mode == 'naive':
+                self.particle_states = torch.cat((reshaped_states[:, :self.pf_state_dim], corrected_states[:, self.pf_state_dim:]), -1).reshape(N, M, self.state_dim)
+                self.kf_covariance = self.ekf.get_covariance().reshape(N, M, state_dim, state_dim)
+                self.kf_covariance[:, :, :self.pf_state_dim, :self.pf_state_dim] = self.jitter_observation*torch.eye(3).to(self.kf_covariance.device)
+            else:
+                self.particle_states = corrected_states.reshape(N, M, self.state_dim)
+                self.kf_covariance = self.ekf.get_covariance().reshape(N, M, state_dim, state_dim)
             
             # Re-weight particles using observations (1-point quadrature)
             meas_log_wts = self.measurement_model(
@@ -505,7 +611,8 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
                 dim=1,
             )
         elif self.estimation_method == "argmax":
-            best_indices = torch.argmax(self.particle_log_weights, dim=1)
+            # best_indices = torch.argmax(self.particle_log_weights, dim=1)
+            best_indices = (M-1) * torch.ones(N, dtype=torch.long)     # index of nominal EKF
             state_estimates = torch.gather(
                 self.particle_states, dim=1, index=best_indices.expand(N, 1, state_dim)
             ).reshape(N, state_dim)
@@ -594,9 +701,9 @@ class AsyncRaoBlackwellizedParticleFilter(tfilter.filters.ParticleFilter):
         self.measurement_model.update_vo_base(*args, **kwargs)
         self.ekf.measurement_model.update_vo_base(*args, **kwargs)
         
-    def update_dynamics(self, *args, **kwargs):
-        self.dynamics_model.update(*args, **kwargs)
-        self.ekf.dynamics_model.update(*args, **kwargs)
+    def update_dynamics(self, *args, pos_x_std=None, pos_y_std=None, pos_z_std=None, **kwargs):
+        self.dynamics_model.update(*args, pos_x_std=pos_x_std, pos_y_std=pos_y_std, pos_z_std=pos_z_std, **kwargs)
+        self.ekf.dynamics_model.update(*args, pos_x_std=2*pos_x_std, pos_y_std=2*pos_y_std, pos_z_std=2*pos_z_std, **kwargs)
 
     def get_covariance(self):
         # convert self.particle_log_weights to weights

@@ -1166,12 +1166,12 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
         }
 
         recorded_data['dynamics_parameters'].append(dict(
-            pos_x_std=0.57, 
-            pos_y_std=0.79, 
-            pos_z_std=1e-3, 
-            vel_x_std=0.04, 
+            pos_x_std=5.57, 
+            pos_y_std=5.79, 
+            pos_z_std=1e-1, 
+            vel_x_std=2.04, 
             vel_y_std=2.11, 
-            vel_z_std=1e-4, 
+            vel_z_std=1e-1, 
             r_std=np.deg2rad(1.0), 
             p_std=np.deg2rad(1.0), 
             y_std=np.deg2rad(15.0), 
@@ -1185,10 +1185,10 @@ def gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_i
             y_std=np.deg2rad(1.0),
             imu_robust_threshold=0.7,
             speed_std=2.17,
-            landmark_std=11.54,
-            speed_scale=0.20,
+            landmark_std=100.54,
+            speed_scale=0.50,
             speed_robust_threshold=5.0,
-            prange_std=0.34, 
+            prange_std=5.34, 
             prange_robust_threshold=3.0,
             carrier_std=10.0,
         ))
@@ -1465,6 +1465,12 @@ def gmm_quantile_1d(means, covs, epsilon):
     # This is done by computing the quantile of each component and taking the maximum
     # Input: means, covs, epsilon
     # Output: tau
+    
+    # clamp covariance to 0.01 to avoid numerical issues
+    covs = torch.clamp(covs, min=0.01)
+
+    # print("means", means)
+    # print("covs", covs)
     num_gaussians = means.shape[0]
     tau = torch.zeros(num_gaussians)
     for i in range(num_gaussians):
@@ -1509,7 +1515,12 @@ def compute_error_bounds(estimated_state, states, covariances, epsilon=0.01):
     # quaternion from world to body frame
     quat_mean = estimated_state[6:10]
     pos_cov_enu = covariances[:, :3, :3]
+    
     quat_cov = torch.mean(covariances[:, 6:10, 6:10], dim=0, keepdim=False)
+    eigs = torch.linalg.eigvalsh(quat_cov)
+    min_eig = torch.min(eigs)
+    if min_eig < 0:
+        quat_cov -= (1 + 1e-2) * min_eig * torch.eye(4)
 
     # Monte Carlo integration to incorporate projection uncertainty
     M = 10
@@ -1520,13 +1531,13 @@ def compute_error_bounds(estimated_state, states, covariances, epsilon=0.01):
     rot_mat = tf.quaternion_to_matrix(quat)
     pos_llv = rot_mat[None, :, :, :] @ delta_pos_enu[:, None, :, None]
     cov_llv = rot_mat[None, :, :, :] @ pos_cov_enu[:, None, :, :] @ rot_mat[None, :, :, :].transpose(-2, -1)
-    pos_llv = torch.mean(pos_llv, dim=1).squeeze(-1)
+    pos_llv = torch.abs(torch.mean(pos_llv, dim=1).squeeze(-1))
     cov_llv = torch.mean(cov_llv, dim=1)
 
     # Compute error bounds
     error_bounds = torch.zeros(3)
     for i in range(3):
-        error_bounds[i] = gmm_quantile_1d(pos_llv[:, i], cov_llv[:, i, i], epsilon/2)
+        error_bounds[i] = gmm_quantile_1d(pos_llv[:, i], cov_llv[:, i, i], epsilon/2)   # largest one-sided bound
     return error_bounds
 
 
@@ -1735,16 +1746,16 @@ def visualize_error_bounds(estimated_states, state_means, state_covariance, stat
         error_bounds[i, :] = compute_error_bounds(estimated_states[t, :], state_means[t, :, :], state_covariance[t, :, :, :], epsilon=0.01)
         # print(error_bounds[i, :])
     enu_error = estimated_states[state_range, :3] - gt_pos[gt_range, :3]
-    gt_rot_mat = tf.euler_angles_to_matrix(torch.tensor(gt_rot[gt_range]), ["X", "Y", "Z"])
+    gt_rot_mat = tf.euler_angles_to_matrix(torch.deg2rad(torch.tensor(gt_rot[gt_range, :])), ["X", "Y", "Z"])
     gt_error = torch.abs((gt_rot_mat @ enu_error[:, :, None]).squeeze(-1))
-
+    
     # create 3 subplots for the 3 dimensions
     plt.figure(figsize=(10, 10))
     
     # plot lateral error and bound
     plt.subplot(311)
     plt.title("Lateral Error")
-    plt.plot(gt_error[:, 0], "r--", label="gt error")
+    plt.plot(gt_error[:, 0], "k--", label="gt error")
     xlims = plt.xlim()
     ylims = plt.ylim()
     plt.plot(error_bounds[:, 0], "r", label="error bound")
@@ -1755,10 +1766,10 @@ def visualize_error_bounds(estimated_states, state_means, state_covariance, stat
     # plot longitudinal error and bound
     plt.subplot(312)
     plt.title("Longitudinal Error")
-    plt.plot(gt_error[:, 1], "b--", label="gt error")
+    plt.plot(gt_error[:, 1], "k--", label="gt error")
     xlims = plt.xlim()
     ylims = plt.ylim()
-    plt.plot(error_bounds[:, 1], "b", label="error bound")
+    plt.plot(error_bounds[:, 1], "r", label="error bound")
     plt.xlim(xlims)
     plt.ylim(ylims)
     plt.legend()
@@ -1766,10 +1777,10 @@ def visualize_error_bounds(estimated_states, state_means, state_covariance, stat
     # plot vertical error and bound
     plt.subplot(313)
     plt.title("Vertical Error")
-    plt.plot(gt_error[:, 2], "g--", label="gt error")
+    plt.plot(gt_error[:, 2], "k--", label="gt error")
     xlims = plt.xlim()
     ylims = plt.ylim()
-    plt.plot(error_bounds[:, 2], "g", label="error bound")
+    plt.plot(error_bounds[:, 2], "r", label="error bound")
     plt.xlim(xlims)
     plt.ylim(ylims)
     plt.legend()

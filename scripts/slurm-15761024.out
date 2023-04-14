@@ -1,0 +1,19 @@
+[I 12:18:16.091 NotebookApp] [jupyter_nbextensions_configurator] enabled 0.6.1
+[W 2023-04-12 12:18:17.731 LabApp] 'ip' has moved from NotebookApp to ServerApp. This config will be passed to ServerApp. Be sure to update your config before our next release.
+[W 2023-04-12 12:18:17.731 LabApp] 'port' has moved from NotebookApp to ServerApp. This config will be passed to ServerApp. Be sure to update your config before our next release.
+[W 2023-04-12 12:18:17.731 LabApp] 'port' has moved from NotebookApp to ServerApp. This config will be passed to ServerApp. Be sure to update your config before our next release.
+[W 2023-04-12 12:18:17.731 LabApp] 'port' has moved from NotebookApp to ServerApp. This config will be passed to ServerApp. Be sure to update your config before our next release.
+[I 2023-04-12 12:18:17.741 LabApp] JupyterLab extension loaded from /home/groups/gracegao/conda_envs/deep_gnss/lib/python3.8/site-packages/jupyterlab
+[I 2023-04-12 12:18:17.741 LabApp] JupyterLab application directory is /home/groups/gracegao/conda_envs/deep_gnss/share/jupyter/lab
+[I 12:18:17.756 NotebookApp] Serving notebooks from local directory: /home/users/shubhgup
+[I 12:18:17.756 NotebookApp] Jupyter Notebook 6.4.0 is running at:
+[I 12:18:17.756 NotebookApp] http://sh02-15n09.int:51221/?token=a3467438a23f772eefd5e5ad048c29dc2e27c8490d966491
+[I 12:18:17.756 NotebookApp]  or http://127.0.0.1:51221/?token=a3467438a23f772eefd5e5ad048c29dc2e27c8490d966491
+[I 12:18:17.756 NotebookApp] Use Control-C to stop this server and shut down all kernels (twice to skip confirmation).
+[C 12:18:17.787 NotebookApp] 
+    
+    To access the notebook, open this file in a browser:
+        file:///home/users/shubhgup/.local/share/jupyter/runtime/nbserver-208948-open.html
+    Or copy and paste one of these URLs:
+        http://sh02-15n09.int:51221/?token=a3467438a23f772eefd5e5ad048c29dc2e27c8490d966491
+     or http://127.0.0.1:51221/?token=a3467438a23f772eefd5e5ad048c29dc2e27c8490d966491

@@ -109,8 +109,11 @@ class XYZModel(tfilter.base.DynamicsModel):
         # The controls are the velocity/acceleration.
         N, state_dim = initial_states.shape
         assert self.state_dim == state_dim
-
-        return initial_states + controls*self.dt, self.cholesky().expand((N, 3, 3))
+        controls_new = torch.zeros_like(controls)
+        controls_new[:, 0] = controls[:, 0]   # x coordinate is not reset
+        controls_new[:, 1] = controls[:, 1]    # y coordinate is not reset
+        controls_new[:, 2] = -initial_states[:, 2].detach()/self.dt    # z coordinate is reset to zero
+        return initial_states + controls_new*self.dt, self.cholesky().expand((N, 3, 3))
 
 class QuaternionOrientationModel(tfilter.base.DynamicsModel):
     def __init__(self, dt = 0.0025):

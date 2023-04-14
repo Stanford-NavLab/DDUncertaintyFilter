@@ -70,7 +70,7 @@ imu_to_vo_idx, vo_to_imu_idx = imu_to_vo_idx_from_timestamp(timestamp, vo_data)
 # Generate ground truth deltas
 gt_pos_delta, gt_rot_delta = gen_gt_deltas(gt_pos, gt_rot, imu_to_gt_idx, vo_to_imu_idx)
 
-parameter_optimization_plots = True
+parameter_optimization_plots = False
 
 if parameter_optimization_plots:
     # Load the results
@@ -100,9 +100,16 @@ N_dim, state_dim = create_state_dim(0, 16)
 
 T_start, T, IMU_rate_div = get_imu_idx(origin_time, end_time, utc_to_imu_idx, 100)
 
+print("Debug ", recorded_data['state_covariance'][0].shape)
+
 estimated_states = torch.zeros(T, state_dim)
-for i, t in tqdm(enumerate(range(T_start+IMU_rate_div, T, IMU_rate_div))):
+num_hypotheses = recorded_data['state_means'][0].shape[0]
+state_means = torch.zeros(T, num_hypotheses, state_dim)
+state_covariance = torch.eye(state_dim).reshape(1, 1, state_dim, state_dim).expand(T, num_hypotheses, state_dim, state_dim).detach().clone()
+for i, t in enumerate(range(T_start+IMU_rate_div, T, IMU_rate_div)):
     estimated_states[t, :] = recorded_data['estimated_states'][i][0, :]
+    state_means[t, :, :] = recorded_data['state_means'][i]
+    state_covariance[t, :, :, :] = recorded_data['state_covariance'][i]
 
 tmax = T
 
@@ -113,25 +120,31 @@ gt_range = [imu_to_gt_idx(t) for t in state_range]
 print("Saving state trajectory to image")
 plt.figure()
 plot_position_estimates(estimated_states, gt_pos, T_start, tmax, imu_to_gt_idx, IMU_rate_div)
-plt.savefig('data/position_plot.png')
+plt.savefig('data/position_plot.svg')
 plt.figure()
 plot_trajectory(estimated_states, state_range, gt_pos, gt_range)
-plt.savefig('data/trajectory_plot.png')
+plt.savefig('data/trajectory_plot.svg')
 
 # Save tracking error to image
 print("Saving tracking error to image")
 plt.figure()
 plot_tracking_error(estimated_states, gt_pos, state_range, imu_to_gt_idx)
-plt.savefig('data/tracking_error_plot.png')
+plt.savefig('data/tracking_error_plot.svg')
+
+# Save position error bounds to image
+print("Saving position error bounds to image")
+plt.figure()
+visualize_error_bounds(estimated_states, state_means, state_covariance, state_range, gt_pos, gt_rot, gt_range)
+plt.savefig('data/error_bounds_plot.svg')
 
 # Save rotation error to image
 print("Saving rotation error to image")
 plt.figure()
 plot_orientation_estimates(estimated_states, state_range, gt_rot, gt_range)
-plt.savefig('data/orientation_plot.png')
+plt.savefig('data/orientation_plot.svg')
 
 # Save velocity error to image
 print("Saving velocity error to image")
 plt.figure()
 plot_velocity_estimates(estimated_states, state_range, gt_pos, gt_range)
-plt.savefig('data/velocity_plot.png')
+plt.savefig('data/velocity_plot.svg')

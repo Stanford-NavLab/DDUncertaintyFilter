@@ -87,29 +87,33 @@ pf_measurement_model = init_filter_measurement_model(dd_data, N_dim, GNSSPFMeasu
 
 reset_filter = gen_reset_function(state_dim, timestamp, gt_pos, gt_vel, gt_rot, imu_to_gt_idx, IMU_rate_div, T_start)
 
-test_filter_base = AsyncExtendedKalmanFilter(
+# test_filter_base = AsyncExtendedKalmanFilter(
+#     dynamics_model=dynamics_model, # Initialise the filter with the dynamic model
+#     measurement_model=kf_measurement_model, # Initialise the filter with the measurement model
+#     )
+test_filter_base = AsyncUnscentedKalmanFilter(
     dynamics_model=dynamics_model, # Initialise the filter with the dynamic model
     measurement_model=kf_measurement_model, # Initialise the filter with the measurement model
     )
 
-test_filter = test_filter_base
-# # Create an instance of the rao-blackwellized particle filter
-# test_filter = AsyncRaoBlackwellizedParticleFilter(
-#     dynamics_model=dynamics_model,  # Dynamics model
-#     measurement_model=pf_measurement_model,  # Measurement model
-#     resample=True,  # Resample particles
-#     estimation_method="weighted_average",  # Use weighted average of particles
-#     num_particles= 20,  # Number of particles
-#     soft_resample_alpha=1.0,  # Soft resampling parameter
-# )
+# test_filter = test_filter_base
+# Create an instance of the rao-blackwellized particle filter
+test_filter = AsyncRaoBlackwellizedParticleFilter(
+    dynamics_model=dynamics_model,  # Dynamics model
+    measurement_model=pf_measurement_model,  # Measurement model
+    resample=True,  # Resample particles
+    estimation_method="weighted_average",  # Use 'weighted_average' or 'argmax' of particles
+    num_particles= 20,  # Number of particles
+    soft_resample_alpha=0.5,  # Soft resampling parameter
+)
 
-# # mask for the position states
-# pf_idx_mask = torch.zeros(state_dim, dtype=torch.bool)
-# pf_idx_mask[:3] = True
+# mask for the position states
+pf_idx_mask = torch.zeros(state_dim, dtype=torch.bool)
+pf_idx_mask[:3] = True
 
-# # This function attaches a filter to the test_filter object. It takes in the dynamics_model, measurement model, and index mask. The mode is set to 'linearization_points' by default. The function then assigns the dynamics model, measurement model, and index mask to the filter. The bank mode is used to specify whether the filter is a bank filter, which is a filter that uses multiple filters to handle multiple targets.
+# This function attaches a filter to the test_filter object. It takes in the dynamics_model, measurement model, and index mask. The mode is set to 'linearization_points' by default. The function then assigns the dynamics model, measurement model, and index mask to the filter. The bank mode is used to specify whether the filter is a bank filter, which is a filter that uses multiple filters to handle multiple targets.
 
-# test_filter.attach_ekf(test_filter_base, pf_idx_mask)
+test_filter.attach_ekf(test_filter_base, pf_idx_mask, mode='linearization_points')  # mode: ['linearization_points', 'naive', 'bank']
 
 def run_timestep(t, recorded_data):
     
@@ -195,6 +199,7 @@ def run_timestep(t, recorded_data):
                 )
             # print("estimated_state (2): ", estimated_state)
         #         print("ransac_t: ", ransac_t)
+        
         estimated_state = vo_update(
             test_filter, estimated_state,
             landmark_3d, pixel_2d, K, ransac_R, ransac_t, 
@@ -235,6 +240,7 @@ def run_timestep(t, recorded_data):
     state_means, state_covariance = test_filter.get_state_statistics()
     recorded_data['state_means'].append(state_means.detach().clone())
     recorded_data['state_covariance'].append(state_covariance.detach().clone())
+    # print("recorded_data['state_covariance'] ", recorded_data['state_covariance'][-1][:, :3, :3])
     recorded_data['imu_times'].append(t)
     
     return recorded_data
@@ -255,7 +261,7 @@ with open('data/recorded_data.pkl', 'wb') as f:
 estimated_states = torch.zeros(T, state_dim)
 num_hypotheses = recorded_data['state_means'][0].shape[0]
 state_means = torch.zeros(T, num_hypotheses, state_dim)
-state_covariance = torch.eye(state_dim).reshape(1, 1, state_dim, state_dim).expand(T, num_hypotheses, state_dim, state_dim)
+state_covariance = torch.eye(state_dim).reshape(1, 1, state_dim, state_dim).expand(T, num_hypotheses, state_dim, state_dim).detach().clone()
 for i, t in enumerate(range(T_start+IMU_rate_div, T, IMU_rate_div)):
     estimated_states[t, :] = recorded_data['estimated_states'][i][0, :]
     state_means[t, :, :] = recorded_data['state_means'][i]
